@@ -1,0 +1,17 @@
+# Build output
+/bin/
+*.o
+*.a
+*.d
+*.iso
+*.iso.bak*
+*.log
+*.wad
+
+# Local junk
+trash/
+backups/
+.DS_Store
+
+# Old rust experiment
+src/rust/target/
