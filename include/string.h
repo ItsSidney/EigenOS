@@ -25,5 +25,8 @@ char* strrchr(const char* s, int c);
 char* strdup(const char* s);
 char* strstr(const char* h, const char* n);
 char* strncpy(char* dest, const char* src, int n);
+char* strcat(char* dest, const char* src);
+void* memchr(const void* s, int c, size_t n);
+void* memmove(void* dest, const void* src, size_t n);
 
 #endif

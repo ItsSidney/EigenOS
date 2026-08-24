@@ -38,6 +38,9 @@ typedef struct {
     uint32_t modified_time;
 } file_t;
 
+/* indexed access for the persistence layer (persist.c) */
+file_t* fs_table_entry(int i);
+
 // Filesystem functions
 void init_filesystem();
 int fs_open(const char* filename, int flags);

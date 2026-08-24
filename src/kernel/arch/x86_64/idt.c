@@ -12,6 +12,7 @@
 #include "kernel/task/task.h"
 #include "gui/wm.h"
 #include <string.h>
+#include <stdio.h>
 
 idt_entry_t idt[IDT_ENTRIES];
 idt_ptr_t idt_ptr;
@@ -73,170 +74,137 @@ static void fault_dump_screen(uint64_t isr_num, uint64_t err_code, uint64_t* reg
     uint32_t fw = get_fb_width(), fh = get_fb_height();
     uint32_t* fb = get_fb_ptr();
     if (!fb || !fw || !fh) return;
-    for (uint32_t i = 0; i < fw * fh; i++) fb[i] = 0x16060A;
+
+    /* Linux-style panic background: near-black */
+    for (uint32_t i = 0; i < fw * fh; i++) fb[i] = 0x0A0A0E;
+
+    int cx = (int)fw / 2;
+    /* ── lambda logo ── */
+    {
+        int e = (int)fh / 16;
+        if (e < 8) e = 8;
+        int lx = cx - e * 2, ly = fh / 10;
+        for (int dy = -e; dy <= e; dy++) {
+            int ax = lx + (-e + e / 6) * dy / e;
+            int bx = lx + (e + e / 6) * dy / e;
+            (void)ax; (void)bx;
+        }
+        /* draw with thick lines: left stroke λ */
+        int k = e / 6;
+        for (int t = -e; t <= e; t++) {
+            int xa = lx - e + (t + e) * (k + e) / (2 * e);
+            int ya = ly - e + (t + e);
+            for (int w = -1; w <= 1; w++) {
+                int px = xa + w, py = ya;
+                if (px >= 0 && px < (int)fw && py >= 0 && py < (int)fh)
+                    fb[py * fw + px] = 0xE5E9F0;
+            }
+        }
+        for (int t = -e; t <= e; t++) {
+            int xb = lx + k + (t + e) * (e - k / 2) / (e * 2);
+            int yb = ly - e + (e - t);
+            for (int w = -1; w <= 1; w++) {
+                int px = xb + w, py = yb;
+                if (px >= 0 && px < (int)fw && py >= 0 && py < (int)fh)
+                    fb[py * fw + px] = 0xE5E9F0;
+            }
+        }
+    }
+
+    /* text rendering via print_char_at on 80x25 grid overlaid on fb */
+    #define PANIC_PUTS(row, col, str, fg) do { \
+        const char* _s = str; \
+        int _c = col; \
+        while (*_s && _c < 79) { print_char_at(*_s++, fg, _c++, row); } \
+    } while(0)
+
+    static const char* hexc = "0123456789ABCDEF";
+    #define PANIC_HEX(buf, val) do { \
+        char* b = buf; \
+        *b++ = '0'; *b++ = 'x'; \
+        for (int _i = 15; _i >= 0; _i--) *b++ = hexc[((val) >> (_i * 4)) & 0xF]; \
+        *b = 0; \
+    } while(0)
 
     char line[96];
-    char buf[80];
-    int row = 0;
-    for (int r = 0; r < 25; r++)
-        for (int c = 0; c < 80; c++)
-            print_char_at(' ', 0x0F, c, r);
+    int row = 4;
+    int col_l = (int)fw / 16 / 8 - 4;
+    if (col_l < 2) col_l = 2;
 
-    fault_draw_line(row++, "  !!! CPU CRITICAL FAULT !!!", 0x4F);
-    fault_draw_line(row++, "", 0x0F);
+    /* header */
+    PANIC_PUTS(row, col_l, "KERNEL PANIC", 0x0C); row += 2;
 
-    void app(char* dst, int* n, const char* src, int max) {
-        while (*src && *n < max - 1) dst[(*n)++] = *src++;
-        dst[*n] = 0;
-    }
-    int nb;
+    /* fault type */
+    static const char* exc_names[] = {
+        "Divide-by-zero", "Debug", "NMI", "Breakpoint", "Overflow",
+        "BOUND range", "Invalid opcode", "Device not available",
+        "Double fault", "Coproc segment", "Invalid TSS", "Segment not present",
+        "Stack fault", "General protection", "Page fault", "Reserved",
+        "x87 FPU error", "Alignment check", "Machine check", "SIMD FP",
+        "Virt exception", "Reserved", "Reserved", "Reserved",
+        "Reserved", "Reserved", "Reserved", "Reserved",
+        "Reserved", "Reserved", "Security", "Reserved"
+    };
+    const char* name = (isr_num < 32) ? exc_names[isr_num] : "Unknown";
 
-    nb = 0;
-    app(buf, &nb, "ISR: ", 79);
-    itoa(isr_num, line);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x1F);
-
-    task_t* cur = get_current_task();
-    if (cur) {
-        nb = 0;
-        app(buf, &nb, "Task: ", 79);
-        app(buf, &nb, cur->name, 79);
-        fault_draw_line(row++, buf, 0x1F);
-    }
-
-    fault_fmt_hex(line, regs[17]);   /* RIP */
-    nb = 0;
-    app(buf, &nb, "RIP: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x3F);
-
-    fault_fmt_hex(line, regs[20]);   /* RSP */
-    nb = 0;
-    app(buf, &nb, "RSP: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x3F);
-
-    fault_fmt_hex(line, regs[16]);   /* error code */
-    nb = 0;
-    app(buf, &nb, "ERR: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x1F);
-
-    fault_fmt_hex(line, regs[10]);   /* RBP */
-    nb = 0;
-    app(buf, &nb, "RBP: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x1F);
-
-    fault_fmt_hex(line, regs[19]);   /* RFLAGS */
-    nb = 0;
-    app(buf, &nb, "RFL: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x1F);
-
-    fault_fmt_hex(line, regs[18]);   /* CS */
-    nb = 0;
-    app(buf, &nb, "CS: 0x", 79);
-    app(buf, &nb, line, 79);
-    fault_draw_line(row++, buf, 0x1F);
+    snprintf(line, sizeof(line), "%s (%lu)", name, (unsigned long)isr_num);
+    PANIC_PUTS(row, col_l, line, 0x0F); row++;
 
     if (isr_num == 14) {
-        uint64_t cr2;
-        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        fault_fmt_hex(line, cr2);
-        nb = 0;
-        app(buf, &nb, "CR2: 0x", 79);
-        app(buf, &nb, line, 79);
-        fault_draw_line(row++, buf, 0x3F);
+        uint64_t cr2_val = 0;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2_val));
+        PANIC_HEX(line, cr2_val);
+        char pf[128]; snprintf(pf, sizeof(pf), "Page fault at %s (code %lu)",
+                               line, (unsigned long)err_code);
+        PANIC_PUTS(row, col_l, pf, 0x0B); row++;
     }
+    row++;
 
-    fault_draw_line(row++, "", 0x0F);
-
-    /* DIAGNOSTIC: dump the iretq frame irq0_handler was about to pop.
-       Fault RSP (regs[20]) is after the 15 GPR pops, so frame_ptr = RSP-120. */
-    {
-        uint64_t frame = regs[20] > 120 ? regs[20] - 120 : 0;
-        fault_fmt_hex(line, frame);
-        nb = 0;
-        app(buf, &nb, "FRAME: 0x", 79);
-        app(buf, &nb, line, 79);
-        if (cur) {
-            fault_fmt_hex(line, cur->rsp);
-            app(buf, &nb, " saved_rsp:0x", 79);
-            app(buf, &nb, line, 79);
-            fault_fmt_hex(line, cur->kernel_stack_base);
-            app(buf, &nb, " kbase:0x", 79);
-            app(buf, &nb, line, 79);
-        }
-        fault_draw_line(row++, buf, 0x2F);
-
-        if (frame >= 0xffffffff80000000ULL && frame < 0xffffffff90000000ULL) {
-            for (int i = 0; i < 20; i += 3) {
-                nb = 0;
-                char t[80];
-                for (int k = 0; k < 3 && i + k < 20; k++) {
-                    uint64_t v = 0;
-                    __builtin_memcpy(&v, (void*)(uintptr_t)(frame + (i + k) * 8), 8);
-                    itoa(i + k, t);
-                    app(buf, &nb, " f[", 79);
-                    app(buf, &nb, t, 79);
-                    app(buf, &nb, "]=", 79);
-                    fault_fmt_hex(line, v);
-                    app(buf, &nb, line, 79);
-                }
-                fault_draw_line(row++, buf, 0x0F);
-            }
-        } else {
-            fault_draw_line(row++, "  frame memory outside kernel range", 0x4F);
-        }
+    /* task info */
+    task_t* cur_task = get_current_task();
+    if (cur_task) {
+        snprintf(line, sizeof(line), "Task: %s (pid %d)",
+                 cur_task->name, cur_task->id);
+        PANIC_PUTS(row, col_l, line, 0x07); row++;
     }
+    row++;
 
-    /* HEAP-OVERLAP: which kmalloc block owns this task's kernel stack? */
-    if (cur) {
-        extern int kheap_block_info(uint64_t addr, uint64_t* os, uint64_t* oz, int* of);
-        uint64_t s = 0, z = 0; int f = -1;
-        nb = 0;
-        app(buf, &nb, "STKBLK: ", 79);
-        if (kheap_block_info(cur->kernel_stack_base, &s, &z, &f)) {
-            fault_fmt_hex(line, s);
-            app(buf, &nb, "start=0x", 79);
-            app(buf, &nb, line, 79);
-            app(buf, &nb, " sz=", 79);
-            char t[32]; itoa(z, t);
-            app(buf, &nb, t, 79);
-            app(buf, &nb, " free=", 79);
-            itoa(f, t);
-            app(buf, &nb, t, 79);
-        } else {
-            app(buf, &nb, "NOT IN HEAP", 79);
-        }
-        fault_draw_line(row++, buf, 0x2F);
+    /* RIP + registers */
+    PANIC_PUTS(row, col_l, "RIP:", 0x08);
+    PANIC_HEX(line, regs[17]); PANIC_PUTS(row, col_l + 6, line, 0x0E); row++;
+    PANIC_PUTS(row, col_l, "RSP:", 0x08);
+    PANIC_HEX(line, regs[20]); PANIC_PUTS(row, col_l + 6, line, 0x0E); row++;
+    PANIC_PUTS(row, col_l, "CS:", 0x08);
+    snprintf(line, sizeof(line), "%04lx", (unsigned long)(regs[18] & 0xFFFF));
+    PANIC_PUTS(row, col_l + 6, line, 0x07); row += 2;
 
-        extern uint64_t gfx_back_buffer_addr(void);
-        extern uint64_t gfx_back_buffer_size(void);
-        extern uint64_t gui_wp_old_addr(void);
-        fault_fmt_hex(line, gfx_back_buffer_addr());
-        nb = 0;
-        app(buf, &nb, "BACKBUF: 0x", 79);
-        app(buf, &nb, line, 79);
-        app(buf, &nb, " sz=", 79);
-        char t[32]; itoa(gfx_back_buffer_size(), t);
-        app(buf, &nb, t, 79);
-        fault_draw_line(row++, buf, 0x1F);
+    PANIC_PUTS(row, col_l, "registers", 0x08); row++;
 
-        fault_fmt_hex(line, gui_wp_old_addr());
-        nb = 0;
-        app(buf, &nb, "WPOLD: 0x", 79);
-        app(buf, &nb, line, 79);
-        fault_draw_line(row++, buf, 0x1F);
+    static const char* reg_names[] = {
+        "rax","rcx","rdx","rsi","rdi","r8","r9","r10",
+        "r11","rbx","rbp","r12","r13","r14","r15"
+    };
+    for (int i = 0; i < 15; i++) {
+        int col_off = (i % 3) * 24;
+        int rr = row + (i / 3);
+        if (rr > 22) break;
+        snprintf(line, sizeof(line), "%-4s", reg_names[i]);
+        PANIC_PUTS(rr, col_l + col_off, line, 0x08);
+        PANIC_HEX(line, regs[i]);
+        PANIC_PUTS(rr, col_l + col_off + 5, line, 0x0B);
     }
+    row += 5 + 1;
 
-    fault_draw_line(row++, "", 0x0F);
-    fault_draw_line(row++, "  System Halted. Reboot the VM.", 0x1F);
+    /* separator */
+    for (int c = col_l; c < 78; c++)
+        print_char_at('-', 0x08, c, row);
+    row++;
 
-    (void)err_code;
-    swap_buffers();
+    PANIC_PUTS(row, col_l, "Kernel panic — not syncing: fatal exception", 0x0C); row++;
+    PANIC_PUTS(row, col_l, "System halted. Press reset or power off.", 0x07);
+
+    #undef PANIC_PUTS
+    #undef PANIC_HEX
 }
 
 void core_exception_handler(uint64_t* registers) {
@@ -367,6 +335,23 @@ void core_exception_handler(uint64_t* registers) {
             for (int i = 0; i < 16; i++) h[15-i] = hx[(dt->pml4_phys >> (i * 4)) & 0x0F];
             serial_puts(h);
             serial_puts("\n");
+            /* Exact return address at [RSP] (instruction right after the
+               faulting call) — not subject to the ustack-bt 120-line cap. */
+            {
+                uint64_t rspv = registers[20];
+                if (rspv >= 0x400000ULL) {
+                    uint64_t rv = 0, rvp = 0;
+                    __builtin_memcpy(&rv, (void*)(uintptr_t)rspv, 8);
+                    if (rspv >= 16) __builtin_memcpy(&rvp, (void*)(uintptr_t)(rspv - 8), 8);
+                    serial_puts("  [ret-addr] *RSP=0x");
+                    for (int i = 0; i < 16; i++) h[15-i] = hx[(rv >> (i * 4)) & 0x0F];
+                    serial_puts(h);
+                    serial_puts("  *(RSP-8)=0x");
+                    for (int i = 0; i < 16; i++) h[15-i] = hx[(rvp >> (i * 4)) & 0x0F];
+                    serial_puts(h);
+                    serial_puts("\n");
+                }
+            }
             for (int i = 0; i < 20; i++) {
                 uint64_t v = 0;
                 __builtin_memcpy(&v, (void*)(uintptr_t)(frame + i * 8), 8);
@@ -487,6 +472,36 @@ void core_exception_handler(uint64_t* registers) {
                 serial_puts("\n");
             }
 
+            /* USER-STACK BACKTRACE: the fault rsp may be corrupted (0), but the
+               call chain above the corruption point is still intact on the user
+               stack. Scan it for candidate code-pointer return addresses. */
+            if (dt->user_stack_base) {
+                serial_puts("  [ustack-bt] scanning user stack 0x");
+                char hb[20];
+                for (int i = 0; i < 16; i++) hb[15-i] = hx[((dt->user_stack_base) >> (i*4)) & 0x0F];
+                hb[16] = 0; serial_puts(hb);
+                serial_puts(" .. 0x");
+                for (int i = 0; i < 16; i++) hb[15-i] = hx[((dt->user_stack_base + USER_STACK_SIZE) >> (i*4)) & 0x0F];
+                serial_puts(hb); serial_puts("\n");
+                uint64_t ub = dt->user_stack_base;
+                uint64_t ut = ub + USER_STACK_SIZE;
+                /* NOTE: ut is one past the last mapped byte (guard). Start at
+                   ut-8 so we never dereference the unmapped top qword. */
+                int ra_count = 0;
+                for (uint64_t a = (ut >= 8 ? ut - 8 : ub); a >= ub && ra_count < 120; a -= 8) {
+                    uint64_t v = 0;
+                    __builtin_memcpy(&v, (void*)(uintptr_t)a, 8);
+                    /* candidate app/code return address (code is at 0x400000+) */
+                    if (v >= 0x400000ULL && v < 0x900000ULL) {
+                        serial_puts("    ra=0x");
+                        for (int i = 0; i < 16; i++) hb[15-i] = hx[(v >> (i*4)) & 0x0F];
+                        serial_puts(hb);
+                        serial_puts("\n");
+                        ra_count++;
+                    }
+                }
+            }
+
             /* ALLOC TRACE: last kmalloc/kfree events with caller RIPs. */
             extern int kheap_trace_dump(uint64_t* tp, uint64_t* tz, int* tf, uint64_t* tc, int tm);
             uint64_t tp_[80], tz_[80], tc_[80]; int tf_[80];
@@ -544,11 +559,14 @@ void core_exception_handler(uint64_t* registers) {
     /* Ring-3 fault: kill the task instead of halting the whole OS. The
        crash details were already dumped to serial above. */
     uint64_t cs = registers[18];
-    if ((cs & ~(uint64_t)3) == 0x18) {
+    task_t* ft = get_current_task();
+    /* Kill only the faulting user task (ring-3 OR any non-kernel task) so the
+       OS keeps running and the user can re-run the crashed app. Genuine kernel
+       faults (no task / kernel leader) still halt the machine. */
+    if (((cs & ~(uint64_t)3) == 0x18) || (ft && ft->id != 0)) {
         uint64_t cr2 = 0;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
-        serial_puts("  [ring-3 fault] killing task, OS continues.\n");
-        task_t* ft = get_current_task();
+        serial_puts("  [task fault] killing task, OS continues.\n");
         if (ft) {
             wm_mark_crashed(ft->id, registers[17], cr2, err_code);
             exit_task(1);
@@ -618,6 +636,12 @@ void init_idt() {
     for (int i = 0; i < 32; i++) {
         set_idt_entry(i, (uint64_t)isrs[i], 0x08, 0x8E);
     }
+    /* Critical faults get their own stacks (see init_tss): a fault while
+     * running on an overflowed kernel stack must be catchable, not a
+     * triple-fault reboot. */
+    set_idt_entry(8,  (uint64_t)isrs[8],  0x08, 0x8E); idt[8].ist  = 1; /* #DF */
+    set_idt_entry(2,  (uint64_t)isrs[2],  0x08, 0x8E); idt[2].ist  = 2; /* NMI */
+    set_idt_entry(18, (uint64_t)isrs[18], 0x08, 0x8E); idt[18].ist = 3; /* #MC */
     
     // IRQ0 — timer
     set_idt_entry(0x20, (uint64_t)irq0_handler, 0x08, 0x8E);

@@ -324,15 +324,18 @@ void I_GetEvent(void)
     }
 
 
-                /*
-            case SDL_MOUSEMOTION:
-                event.type = ev_mouse;
-                event.data1 = mouse_button_state;
-                event.data2 = AccelerateMouse(sdlevent.motion.xrel);
-                event.data3 = -AccelerateMouse(sdlevent.motion.yrel);
-                D_PostEvent(&event);
-                break;
-                */
+    /* Mouse: relative deltas + button state (camera look + click-to-fire).
+       DG_GetMouse returns raw deltas accumulated since the last call. */
+    {
+        int mb = 0, mdx = 0, mdy = 0;
+        if (DG_GetMouse(&mb, &mdx, &mdy)) {
+            event.type = ev_mouse;
+            event.data1 = (unsigned int)mb;
+            event.data2 = mdx;
+            event.data3 = -mdy;
+            D_PostEvent(&event);
+        }
+    }
 }
 
 void I_InitInput(void)

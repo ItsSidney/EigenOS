@@ -45,7 +45,10 @@
 #define SYS_EPOLL        28   /* epoll: (sub-op, ...) level-triggered monitors */
 #define SYS_PIPE         29   /* pipe(2): (int[2] pipefd) -> 0 */
 #define SYS_FCNTL        30   /* fcntl(2): (fd, cmd, arg) -> val */
-#define SYSCALL_COUNT    31
+#define SYS_SIGNAL       32   /* signal(sig, handler) - install handler          */
+#define SYS_KILL         33   /* kill(pid, sig)                                  */
+#define SYS_SIGRETURN    34   /* internal: trampoline return from handler        */
+#define SYSCALL_COUNT    45
 
 /* SYS_EPOLL sub-operations (mirror of include/user/eigen.h) */
 #define EPOLL_EPOLL_CREATE  0

@@ -90,6 +90,7 @@ void gfx_set_clip(int x, int y, int w, int h);
 void gfx_push_clip(int x, int y, int w, int h);
 void gfx_pop_clip(void);
 void gfx_reset_clip(void);
+void gfx_get_clip(int* x0, int* y0, int* x1, int* y1);
 
 // Basic shapes
 void gfx_fill_rect(int x, int y, int w, int h, uint32_t rgb);

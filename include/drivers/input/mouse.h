@@ -27,6 +27,10 @@ int mouse_get_x(void);
 int mouse_get_y(void);
 int mouse_get_buttons(void);
 
+// Raw device deltas accumulated since the last call, then reset. Used for
+// relative/mouse-look input (e.g. DOOM camera control) without edge clamping.
+void mouse_get_deltas(int* dx, int* dy);
+
 // Returns 1 if mouse has moved or button state changed since last call
 int mouse_has_update(void);
 

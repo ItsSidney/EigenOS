@@ -46,4 +46,6 @@
 int* __errno_location(void);
 #define errno (*__errno_location())
 
+#define ELOOP 40
 #endif
+#define EOVERFLOW 75

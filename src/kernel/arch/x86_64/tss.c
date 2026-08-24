@@ -22,6 +22,16 @@ void init_tss() {
     
     // Set I/O map base to end of TSS (no I/O permission map)
     tss.iomap_base = sizeof(tss_t);
+
+    /* Interrupt Stack Table: #DF(IST1) NMI(IST2) MC(IST3).
+     * Static so they exist before the heap is up. A stack-switched fault
+     * (e.g. kernel-stack overflow) lands here instead of triple-faulting. */
+    {
+        static __attribute__((aligned(16))) uint8_t ist_stack[3][16384];
+        tss.ist1 = (uint64_t)(ist_stack[0] + sizeof(ist_stack[0]));
+        tss.ist2 = (uint64_t)(ist_stack[1] + sizeof(ist_stack[1]));
+        tss.ist3 = (uint64_t)(ist_stack[2] + sizeof(ist_stack[2]));
+    }
 }
 
 void set_tss_stack(uint64_t stack0) {

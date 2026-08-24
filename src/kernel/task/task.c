@@ -65,12 +65,119 @@ static int tasking_enabled = 0;
 #define SYS_SLEEP       5
 #define SYS_EXIT        6
 
+/* POSIX-style signals (tier 1) */
+extern void serial_puts(const char* s);
+extern void serial_u64(uint64_t v);
+int send_signal(int pid, int sig) {
+    if (sig <= 0 || sig >= NSIG) return -1;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        task_t* t = &tasks[i];
+        if (t->state == TASK_FREE || t->id != pid) continue;
+        if (t->state == TASK_DEAD) return -1;
+        __atomic_fetch_or (&t->sig_pending, 1u << sig, __ATOMIC_RELAXED);
+        return 0;
+    }
+    return -1;
+}
+
+/* Called by the scheduler with CR3 already switched to `t`'s address
+ * space, before its saved frame is resumed. Injects a handler trampoline
+ * onto the user stack or applies default termination. */
+void task_deliver_signals(task_t* t) {
+    if (!t->sig_pending || t->ring != TASK_RING3) return;
+    if (t->sig_in_handler) return;          /* queue until handler returns */
+
+    registers_t* r = (registers_t*)t->rsp;
+    if ((uint64_t)r < 0xffffffff80000000ULL) return;
+
+    while (t->sig_pending) {
+        int sig = __builtin_ctz(t->sig_pending);
+        void* h = t->sig_handlers[sig];
+
+        /* SIGKILL ignores handlers; unhandled -> default terminate */
+        if (sig == SIGKILL || !h) {
+            __atomic_fetch_and(&t->sig_pending, ~(1u << sig), __ATOMIC_RELAXED);
+            serial_puts("[SIG] kill pid=");
+            serial_u64((uint64_t)t->id);
+            serial_puts(" sig=");
+            serial_u64((uint64_t)sig);
+            serial_puts("\n");
+            t->exit_code = 128 + sig;
+            t->state = TASK_DEAD;
+            if (t->kernel_stack_base) {
+                kfree((void*)t->kernel_stack_base);
+                t->kernel_stack_base = 0; t->kernel_stack_top = 0;
+            }
+            if (t->user_stack_base) {
+                kfree((void*)t->user_stack_base);
+                t->user_stack_base = 0; t->user_stack_top = 0;
+            }
+            t->rsp = 0;
+            return;
+        }
+
+        __atomic_fetch_and(&t->sig_pending, ~(1u << sig), __ATOMIC_RELAXED);
+
+        /* Build a tiny trampoline on the user stack:
+             b8 22 00 00 00   mov eax, SYS_SIGRETURN
+             cd 80            int  0x80
+             90               nop                                   */
+        uint64_t usp = r->rsp & ~0xFULL;
+        usp -= 16;
+        uint64_t tc = usp - 64;
+        uint8_t code[8] = { 0xB8, 0, 0, 0, 0, 0xCD, 0x80, 0x90 };
+        code[1] = 34; code[2] = 0; code[3] = 0; code[4] = 0;
+        for (int i = 0; i < 8; i++)
+            ((volatile uint8_t*)tc)[i] = code[i];
+        *(volatile uint64_t*)usp = tc;      /* handler's RET address */
+
+        t->sig_save = *r;
+        r->rip    = (uint64_t)h;
+        r->rdi    = (uint64_t)sig;
+        r->rsp    = usp;
+        r->rflags |= 0x200;                  /* IF */
+        r->rflags &= ~0x400ULL;              /* clear DF */
+        t->sig_in_handler = 1;
+        return;
+    }
+}
+
+int g_fpu_disabled = 1;   /* set to 1 to debug FPU-related crashes */
+#define KSTACK_CANARY 0xC0DEC0DEFEEDFACEULL
+
+/* FPU/SSE context (asm helpers in cpu_state.asm) */
+extern void cpu_save_fpu(void* buf);
+extern void cpu_restore_fpu(const void* buf);
+static __attribute__((aligned(64))) uint64_t g_master_fpu[64];
+static int g_master_ready = 0;
+
+static void kstack_canary_set(uint64_t base) {
+    if (base) *(volatile uint64_t*)base = KSTACK_CANARY;
+}
+static void kstack_canary_check(const task_t* t) {
+    if (!t->kernel_stack_base) return;
+    if (*(volatile uint64_t*)t->kernel_stack_base != KSTACK_CANARY) {
+        extern void serial_puts(const char* s);
+        extern void serial_u64(uint64_t v);
+        serial_puts("[KSTACK] CANARY SMASHED task=");
+        serial_u64((uint64_t)t->id);
+        serial_puts(" name="); serial_puts(t->name);
+        serial_puts(" -- halting to contain corruption\n");
+        __asm__ volatile("cli; hlt");
+        for(;;){}
+    }
+}
+
 task_t* get_current_task(void) {
     if (current_task_idx < 0) return 0;
     return &tasks[current_task_idx];
 }
 
 void init_tasking(void) {
+    /* Capture a pristine FPU/SSE image as the template every new task
+     * starts from (init_fpu has already run by the time we're called). */
+    cpu_save_fpu(g_master_fpu);
+    g_master_ready = 1;
     for (int i = 0; i < MAX_TASKS; i++) {
         tasks[i].state = TASK_FREE;
         tasks[i].id = 0;
@@ -83,6 +190,7 @@ void init_tasking(void) {
     tasks[0].state = TASK_RUNNING;
     tasks[0].ring = TASK_RING0;
     tasks[0].kernel_stack_base = (uint64_t)kmalloc(KERNEL_STACK_SIZE);
+    kstack_canary_set(tasks[0].kernel_stack_base);
     tasks[0].kernel_stack_top = tasks[0].kernel_stack_base + KERNEL_STACK_SIZE;
     tasks[0].user_stack_base = 0;
     tasks[0].user_stack_top = 0;
@@ -136,6 +244,7 @@ int create_task(void (*entry)(void), const char* name) {
     
     // Allocate kernel stack
     tasks[slot].kernel_stack_base = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16);
+    kstack_canary_set(tasks[slot].kernel_stack_base);
     if (!tasks[slot].kernel_stack_base) {
         tasks[slot].state = TASK_FREE;
         return -1;
@@ -188,6 +297,7 @@ int create_user_process(void (*entry)(void), const char* name) {
     
     // Allocate kernel stack
     tasks[slot].kernel_stack_base = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16);
+    kstack_canary_set(tasks[slot].kernel_stack_base);
     if (!tasks[slot].kernel_stack_base) {
         tasks[slot].state = TASK_FREE;
         return -1;
@@ -278,13 +388,54 @@ int create_user_process_elf(const char* name) {
    POSIX-style argv. argv strings must live in the CALLER's address space
    (kernel memory for ring-0 callers, validated user memory for syscalls);
    they are copied into the new process's stack before it starts. */
-int create_user_process_elf_args(const char* name, int argc, char* const argv[]) {
+int create_user_process_elf_redir(const char* name, int argc, char* const argv[],
+                                   const int parent_redir[3]) {
     const void* data = 0;
     uint64_t size = 0;
     uint64_t entry = 0;
-    if (user_module_find(name, &data, &size) != 0) {
+    /* Accept "/path/name.elf", "name.elf" or bare "name": modules are
+       registered under their basename without extension. */
+    char modname[32];
+    {
+        const char* slash = 0;
+        for (const char* q = name; q && *q; q++) if (*q == '/') slash = q;
+        const char* base = slash ? slash + 1 : name;
+        size_t bi = 0;
+        while (base[bi] && base[bi] != '.' && bi < sizeof(modname)-1) {
+            modname[bi] = base[bi]; bi++;
+        }
+        modname[bi] = 0;
+    }
+    if (user_module_find(modname, &data, &size) != 0) {
         klog("[SPAWN] module not found");
         return -2;
+    }
+
+    /* Phase 0: snapshot the parent's fd metadata for slots the caller wants
+       the child to inherit (stdin/stdout/stderr). Pipe fds are refcounted
+       kernel objects (pipes[]), so the child gets its own fd table entries
+       pointing at the same pipe; file fds share the fs index. */
+    struct redir_snap { int type; int pno; int end; int fflags; int foff; } rs[3] = {
+        { -1, 0, 0, 0, 0 }, { -1, 0, 0, 0, 0 }, { -1, 0, 0, 0, 0 } };
+    if (parent_redir) {
+        task_t* parent = get_current_task();
+        for (int i = 0; i < 3; i++) {
+            int pfd = parent_redir[i];
+            if (pfd < 0 || pfd >= MAX_FDS) continue;
+            if (parent->fd_types[pfd] == FD_PIPE) {
+                rs[i].type = FD_PIPE;
+                rs[i].pno  = parent->fd_pipe[pfd];
+                rs[i].end  = parent->fd_flags_extra[pfd] & 1;
+            } else if (parent->fd_types[pfd] == FD_PTY) {
+                rs[i].type = FD_PTY;
+                rs[i].pno  = parent->fd_pty[pfd];
+                rs[i].end  = parent->fd_flags_extra[pfd] & 1;
+            } else if (parent->fd_flags[pfd] > 0) {
+                rs[i].type  = 100; /* file fd marker */
+                rs[i].fflags = parent->fd_flags[pfd];
+                rs[i].foff   = parent->fd_offsets[pfd];
+            }
+        }
     }
 
     /* Phase 1: copy argv strings into kernel scratch while the caller's
@@ -334,11 +485,56 @@ int create_user_process_elf_args(const char* name, int argc, char* const argv[])
     while (name[j] && j < 31) { tasks[slot].name[j] = name[j]; j++; }
     tasks[slot].name[j] = '\0';
 
+    /* Install inherited stdin/stdout/stderr (slots 0..2). */
+    for (int i = 0; i < 3; i++) {
+        if (rs[i].type == FD_PIPE) {
+            tasks[slot].fd_types[i]      = FD_PIPE;
+            tasks[slot].fd_pipe[i]       = (uint8_t)rs[i].pno;
+            tasks[slot].fd_flags_extra[i]= rs[i].end;
+            if (rs[i].end & 1) pipes[rs[i].pno].writer_count++;
+            else               pipes[rs[i].pno].reader_count++;
+        } else if (rs[i].type == FD_PTY) {
+            extern void pty_dup_ref(int idx, int is_master);
+            tasks[slot].fd_types[i]       = FD_PTY;
+            tasks[slot].fd_pty[i]         = (uint8_t)rs[i].pno;
+            tasks[slot].fd_flags_extra[i] = rs[i].end;
+            pty_dup_ref(rs[i].pno, rs[i].end);
+            { extern void serial_puts(const char*); extern void serial_u64(uint64_t);
+              serial_puts("[PTY] child fd"); serial_u64((uint64_t)i);
+              serial_puts(" -> idx"); serial_u64((uint64_t)rs[i].pno);
+              serial_puts(" end="); serial_u64((uint64_t)rs[i].end); serial_puts("\n"); }
+        } else if (rs[i].type == 100) {
+            tasks[slot].fd_flags[i]  = rs[i].fflags;
+            tasks[slot].fd_offsets[i]= rs[i].foff;
+        }
+    }
+
     tasks[slot].kernel_stack_base = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16);
+    kstack_canary_set(tasks[slot].kernel_stack_base);
     if (!tasks[slot].kernel_stack_base) {
         tasks[slot].state = TASK_FREE;
         return -1;
     }
+    /* Install inherited stdin/stdout/stderr (slots 0..2). */
+    for (int i = 0; i < 3; i++) {
+        if (rs[i].type == FD_PIPE) {
+            tasks[slot].fd_types[i]       = FD_PIPE;
+            tasks[slot].fd_pipe[i]        = (uint8_t)rs[i].pno;
+            tasks[slot].fd_flags_extra[i] = rs[i].end;
+            if (rs[i].end & 1) pipes[rs[i].pno].writer_count++;
+            else               pipes[rs[i].pno].reader_count++;
+        } else if (rs[i].type == FD_PTY) {
+            extern void pty_dup_ref(int idx, int is_master);
+            tasks[slot].fd_types[i]       = FD_PTY;
+            tasks[slot].fd_pty[i]         = (uint8_t)rs[i].pno;
+            tasks[slot].fd_flags_extra[i] = rs[i].end;
+            pty_dup_ref(rs[i].pno, rs[i].end);
+        } else if (rs[i].type == 100) {
+            tasks[slot].fd_flags[i]   = rs[i].fflags;
+            tasks[slot].fd_offsets[i] = rs[i].foff;
+        }
+    }
+
     tasks[slot].kernel_stack_top = abi_stack_top(tasks[slot].kernel_stack_base, KERNEL_STACK_SIZE);
 
     /* Interrupts must stay DISABLED for the entire window from vmm_activate_pml4
@@ -422,19 +618,34 @@ int create_user_process_elf_args(const char* name, int argc, char* const argv[])
        argument block is never clobbered by main()'s frames. RSP % 16 == 8
        at entry keeps every `call` site in main() aligned per SysV. */
     uint64_t top = USER_STACK_VADDR + USER_STACK_SIZE;
+
+    /* default environment for boot/spawned processes (musl getenv reads
+       envp from the stack; execve supplies its own). */
+    static const char* def_env[] = {
+        "PATH=/user:/bin", "HOME=/home/eigen", "USER=eigen",
+        "TERM=eigen", "SHELL=/user/sh.elf", 0 };
+    int nenv = 0;
+    while (def_env[nenv]) nenv++;
+    size_t elen = 0;
+    for (int i = 0; i < nenv; i++) {
+        size_t l = 0; while (def_env[i][l]) l++;
+        elen += l + 1;
+    }
+
     size_t nlen = 0;
     while (name[nlen]) nlen++;
     size_t slen = nlen + 1;
     for (int i = 0; i < nargs; i++) slen += arg_len[i] + 1;
+    slen += elen;
     /* argv block below the strings, 16 bytes of slack so rounding down
        can never collide with them; RSP must start ≡ 8 (mod 16) per SysV
        (arr itself is ≡ 0 after the mask, +8 gives the ≡ 8 entry state). */
-    uint64_t arr = top - slen - (uint64_t)(nargs + 3) * 8 - 16;
+    uint64_t arr = top - slen - (uint64_t)(nargs + nenv + 6) * 8 - 16;
     arr &= ~(uint64_t)15;
     arr += 8;
     uint64_t* a = (uint64_t*)arr;
     a[0] = (uint64_t)(nargs + 1);                   /* argc includes argv[0] */
-    uint64_t sp = top - slen;                       /* strings: [sp, top) */
+    uint64_t sp = top - slen;                       /* argv strings: [top-slen, top-elen) */
     for (size_t j = 0; j < nlen; j++) ((char*)sp)[j] = name[j];
     ((char*)sp)[nlen] = 0;
     a[1] = sp;                                      /* argv[0] = program name */
@@ -445,7 +656,23 @@ int create_user_process_elf_args(const char* name, int argc, char* const argv[])
         a[i + 2] = sp;                              /* argv[1..n] = real args */
         sp += arg_len[i] + 1;
     }
-    a[nargs + 2] = 0;                               /* argv[n+1] = NULL */
+    /* argv NULL then envp block then auxv terminator — musl _start walks
+       argv until NULL, takes &argv[argc+1] as envp, then scans auxv. */
+    uint64_t wi = nargs + 2;
+    a[wi++] = 0;                                    /* argv NULL */
+    uint64_t eslot = wi;
+    wi += nenv + 1;                                 /* env ptrs + NULL */
+    a[wi++] = 0; a[wi++] = 0;                       /* auxv: AT_NULL pair */
+    /* write env strings + pointers */
+    uint64_t esp = top - elen;                      /* env strings: [top-elen, top) */
+    for (int i = 0; i < nenv; i++) {
+        const char* ev = def_env[i];
+        size_t l = 0; while (ev[l]) l++;
+        for (size_t j = 0; j <= l; j++) ((char*)esp)[j] = ev[j];
+        a[eslot + i] = esp;
+        esp += l + 1;
+    }
+    a[eslot + nenv] = 0;
     tasks[slot].user_stack_top = arr;
 
     /* Restore the caller's address space; the new task runs under its own
@@ -624,6 +851,12 @@ void thread_exit_task(int code) {
 }
 
 void exit_task(int code) {
+    { extern void serial_puts(const char*); extern void serial_u64(uint64_t);
+      task_t* ct = get_current_task();
+      serial_puts("[EXIT] task="); serial_u64(ct ? (uint64_t)ct->id : 0);
+      serial_puts(" name="); serial_puts(ct ? ct->name : "?");
+      serial_puts(" code="); serial_u64((uint64_t)(uint32_t)code); serial_puts("\n"); }
+
     __asm__ volatile("cli");
     if (current_task_idx > 0) {
         task_t* t = &tasks[current_task_idx];
@@ -724,7 +957,7 @@ int sys_open(const char* path, int flags) {
 /* Pipe ring buffers live globally for the whole kernel session. */
 struct pipe_buf pipes[MAX_PIPES];
 
-static int alloc_fd(task_t* t) {
+int alloc_fd(task_t* t) {
     int s = 3;   /* 0/1/2 are reserved for stdin/stdout/stderr */
     for (; s < MAX_FDS; s++) {
         if (!t->fds[s] && !t->fd_flags[s] && t->fd_types[s] == FD_VFS) return s;
@@ -785,19 +1018,34 @@ int sys_pipe(int pipefd[2]) {
 int sys_fcntl(int fd, int cmd, int arg) {
     if (fd < 0 || fd >= MAX_FDS) return -1;
     task_t* cur = get_current_task();
+    if (cur->fd_types[fd] == FD_PTY) {
+        extern int pty_set_fg(int idx, uint32_t pid);
+        extern int pty_set_raw(int idx, int raw);
+        extern int pty_set_winsize(int idx, uint32_t rows, uint32_t cols);
+        switch (cmd) {
+        case 1000: return pty_set_fg(cur->fd_pty[fd], (uint32_t)arg);
+        case 1001: return pty_set_raw(cur->fd_pty[fd], (int)arg);
+        case 1002:
+            return pty_set_winsize(cur->fd_pty[fd],
+                                   (uint32_t)(arg >> 16),
+                                   (uint32_t)(arg & 0xFFFF));
+        default: break;
+        }
+    }
     switch (cmd) {
     case 3:  /* F_GETFL */
-        if (cur->fd_types[fd] == FD_PIPE) return (int)cur->fd_flags_extra[fd]; /* O_RDONLY/O_WRONLY | O_NONBLOCK */
+        if (cur->fd_types[fd] == FD_PIPE || cur->fd_types[fd] == FD_PTY)
+            return (int)cur->fd_flags_extra[fd] & 0x801;
         if (cur->fd_flags[fd] > 0 || cur->fds[fd]) return 0;
         return -(int)EBADF;
-    case 4:  /* F_SETFL */
-        if (cur->fd_types[fd] != FD_PIPE) {
-            if (cur->fd_flags[fd] > 0 || cur->fds[fd]) { cur->fd_flags_extra[fd] = arg & 0x800; return 0; }
-            return -1;
+    case 4:  /* F_SETFL: pipes AND ptys carry O_NONBLOCK in bit 0x800 */
+        if (cur->fd_types[fd] == FD_PIPE || cur->fd_types[fd] == FD_PTY) {
+            if (arg & 0x800) cur->fd_flags_extra[fd] |= 0x800;
+            else             cur->fd_flags_extra[fd] &= ~0x800;
+            return 0;
         }
-        if (arg & 0x800) cur->fd_flags_extra[fd] |= 0x800;   /* set O_NONBLOCK */
-        else            cur->fd_flags_extra[fd] &= ~0x800;    /* clear          */
-        return 0;
+        if (cur->fd_flags[fd] > 0 || cur->fds[fd]) { cur->fd_flags_extra[fd] = arg & 0x800; return 0; }
+        return -1;
     default:
         return -1;
     }
@@ -814,6 +1062,11 @@ int sys_read(int fd, char* buf, uint32_t count) {
             if (n == -1 && !nonblock) sleep_task(5);    /* wait for producer */
             else return -1;                             /* nonblock empty => EAGAIN */
         }
+    }
+    if (cur->fd_types[fd] == FD_PTY) {
+        extern int pty_read(int, int, char*, uint32_t, int);
+        return pty_read(cur->fd_pty[fd], cur->fd_flags_extra[fd] & 1, buf,
+                        count, cur->fd_flags_extra[fd] & 0x800);
     }
     if (cur->fd_flags[fd] > 0) {
         int idx = cur->fd_flags[fd] - 1;
@@ -855,8 +1108,18 @@ int sys_write(int fd, const char* buf, uint32_t count) {
         if (n < 0) return -1;                            /* no readers */
         return n;
     }
-    if (cur->fd_flags[fd] > 0)
-        return fs_write(cur->fd_flags[fd] - 1, buf, (int)count);
+    if (cur->fd_types[fd] == FD_PTY) {
+        extern int pty_write(int, int, const char*, uint32_t);
+        return pty_write(cur->fd_pty[fd], cur->fd_flags_extra[fd] & 1, buf, count);
+    }
+    if (cur->fd_flags[fd] > 0) {
+        int n = fs_write(cur->fd_flags[fd] - 1, buf, (int)count);
+        if (n > 0) {
+            extern void persist_mark_dirty(void);
+            persist_mark_dirty();
+        }
+        return n;
+    }
     if (!cur->fds[fd]) return -1;
     return vfs_write(cur->fds[fd], buf, count, 0);
 }
@@ -884,6 +1147,13 @@ void sys_close(int fd) {
         }
         cur->fd_types[fd] = FD_VFS;
         cur->fd_pipe[fd] = 0;
+        cur->fd_flags_extra[fd] = 0;
+    }
+    if (cur->fd_types[fd] == FD_PTY) {
+        extern void pty_close(int, int);
+        pty_close(cur->fd_pty[fd], cur->fd_flags_extra[fd] & 1);
+        cur->fd_types[fd] = FD_VFS;
+        cur->fd_pty[fd] = 0;
         cur->fd_flags_extra[fd] = 0;
     }
 }
@@ -933,6 +1203,12 @@ uint64_t schedule(uint64_t current_rsp) {
     
     if (current_task_idx >= 0) {
         task_t* cur = &tasks[current_task_idx];
+        kstack_canary_check(cur);
+        /* Eager FPU save: without this, every preempted app leaves its
+         * XMM state live for the next task — silent cross-app corruption
+         * for anything float-heavy (ImGui, DOOM, TinyGL). */
+        extern int g_fpu_disabled;
+        if (!g_fpu_disabled) { cpu_save_fpu(cur->fpu_state); cur->fpu_valid = 1; }
         cur->rsp = current_rsp;
         if (cur->state == TASK_RUNNING) {
             cur->state = TASK_READY;
@@ -1008,6 +1284,20 @@ uint64_t schedule(uint64_t current_rsp) {
     extern void wrmsr(uint32_t msr, uint64_t val);
     wrmsr(0xC0000100, next->fs_base);
 
+    /* Deliver pending signals now: CR3 targets `next`, and its saved
+       frame is still on its kernel stack, fully writable. */
+    task_deliver_signals(next);
+
+    /* Restore incoming task's FPU/SSE (fresh tasks get the master image). */
+    if (!g_fpu_disabled) {
+        if (next->fpu_valid) cpu_restore_fpu(next->fpu_state);
+        else if (g_master_ready) {
+            memcpy(next->fpu_state, g_master_fpu, sizeof(g_master_fpu));
+            next->fpu_valid = 1;
+            cpu_restore_fpu(next->fpu_state);
+        }
+    }
+
     /* DIAGNOSTIC: a task's saved rsp must point into the kernel image/heap
        (kernel stacks are kmalloc'd there). A hhdm/user/zero rsp means the
        popped iretq frame is garbage -> ISR 13 at irq0_handler's iretq. */
@@ -1027,4 +1317,452 @@ uint64_t schedule(uint64_t current_rsp) {
     }
 
     return next->rsp;
+}
+
+int create_user_process_elf_args(const char* name, int argc, char* const argv[]) {
+    static const int no_redir[3] = { -1, -1, -1 };
+    return create_user_process_elf_redir(name, argc, argv, no_redir);
+}
+
+/* ================================================================== */
+/* POSIX process syscalls (fork/execve/wait4/getdents64/readv/writev/ */
+/* dup2/arch_prctl/set_tid_address) — the foundation for a hosted musl.*/
+/* ================================================================== */
+
+extern uint64_t hhdm_offset;
+extern int elf_load(const void* data, uint64_t size, uint64_t* entry);
+
+/* Copy every present user page (vaddr < 0x800000000000) from `src_pml4`
+   into `dst_pml4`, building intermediate tables as needed. Both PML4s are
+   accessed through the hhdm so no CR3 switching is required. Returns 0 on
+   success, -1 on OOM. */
+static int copy_user_as(uint64_t src_pml4_phys, uint64_t dst_pml4_phys) {
+    uint64_t* src = (uint64_t*)(src_pml4_phys + hhdm_offset);
+    uint64_t* dst = (uint64_t*)(dst_pml4_phys + hhdm_offset);
+    const uint64_t USER_HALF = 256;
+    for (uint64_t p4 = 0; p4 < USER_HALF; p4++) {
+        uint64_t e4 = src[p4];
+        if (!(e4 & 1)) continue;
+        uint64_t* l3s = (uint64_t*)((e4 & 0x000FFFFFFFFFF000ULL) + hhdm_offset);
+        /* child L3 page */
+        uint64_t d3p = pmm_alloc(); if (!d3p) return -1;
+        uint64_t* l3d = (uint64_t*)(d3p + hhdm_offset);
+        for (int i = 0; i < 512; i++) l3d[i] = 0;
+        dst[p4] = d3p | (e4 & 0xFFF & ~(uint64_t)1 ? (e4 & 0xFFF) : (e4 & 0xFFF));
+        for (uint64_t p3 = 0; p3 < 512; p3++) {
+            uint64_t e3 = l3s[p3];
+            if (!(e3 & 1)) continue;
+            if (e3 & 0x80) { /* 1GB leaf — not used by user mappings today */
+                continue;
+            }
+            uint64_t* l2s = (uint64_t*)((e3 & 0x000FFFFFFFFFF000ULL) + hhdm_offset);
+            uint64_t d2p = pmm_alloc(); if (!d2p) return -1;
+            uint64_t* l2d = (uint64_t*)(d2p + hhdm_offset);
+            for (int i = 0; i < 512; i++) l2d[i] = 0;
+            l3d[p3] = d2p | (e3 & 0xFFF);
+            for (uint64_t p2 = 0; p2 < 512; p2++) {
+                uint64_t e2 = l2s[p2];
+                if (!(e2 & 1)) continue;
+                if (e2 & 0x80) { /* 2MB leaf: split not needed by ELF loader */
+                    continue;
+                }
+                uint64_t* l1s = (uint64_t*)((e2 & 0x000FFFFFFFFFF000ULL) + hhdm_offset);
+                uint64_t d1p = pmm_alloc(); if (!d1p) return -1;
+                uint64_t* l1d = (uint64_t*)(d1p + hhdm_offset);
+                for (int i = 0; i < 512; i++) l1d[i] = 0;
+                l2d[p2] = d1p | (e2 & 0xFFF);
+                for (uint64_t p1 = 0; p1 < 512; p1++) {
+                    uint64_t e1 = l1s[p1];
+                    if (!(e1 & 1)) continue;
+                    uint64_t sp_phys = e1 & 0x000FFFFFFFFFF000ULL;
+                    uint64_t dp_phys = pmm_alloc(); if (!dp_phys) return -1;
+                    __builtin_memcpy((void*)(dp_phys + hhdm_offset),
+                                     (void*)(sp_phys + hhdm_offset), 4096);
+                    l1d[p1] = dp_phys | (e1 & 0xFFF);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Duplicate fd table with pipe/pty refcount bookkeeping. */
+static void dup_fd_table(task_t* from, task_t* to) {
+    for (int f = 0; f < MAX_FDS; f++) {
+        to->fds[f]          = from->fds[f];
+        to->fd_flags[f]     = from->fd_flags[f];
+        to->fd_offsets[f]   = from->fd_offsets[f];
+        to->fd_types[f]     = from->fd_types[f];
+        to->fd_pipe[f]      = from->fd_pipe[f];
+        to->fd_pty[f]       = from->fd_pty[f];
+        to->fd_flags_extra[f]= from->fd_flags_extra[f];
+        if (to->fd_types[f] == FD_PIPE) {
+            if (from->fd_flags_extra[f] & 1) pipes[from->fd_pipe[f]].writer_count++;
+            else                             pipes[from->fd_pipe[f]].reader_count++;
+        } else if (to->fd_types[f] == FD_PTY) {
+            extern void pty_dup_ref(int idx, int is_master);
+            pty_dup_ref(to->fd_pty[f], from->fd_flags_extra[f] & 1);
+        }
+    }
+}
+
+long sys_fork(void) {
+    task_t* cur = get_current_task();
+    if (!cur || cur->ring != TASK_RING3) return -1;
+
+    int slot = -1;
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (tasks[i].state == TASK_FREE) { slot = i; break; }
+    if (slot < 0) return -EIGEN_ERR_NOMEM;
+
+    task_t* ch = &tasks[slot];
+    memset(ch, 0, sizeof(*ch));
+    ch->id = next_task_id++;
+    ch->ppid = cur->id;
+    ch->group = ch->id;
+    ch->ring = TASK_RING3;
+    ch->state = TASK_FREE;
+    { size_t ni=0; while (cur->name[ni] && ni < sizeof(ch->name)-1) { ch->name[ni]=cur->name[ni]; ni++; } ch->name[ni]=0; }
+
+    ch->kernel_stack_base = (uint64_t)kmalloc(KERNEL_STACK_SIZE + 16);
+    kstack_canary_set(ch->kernel_stack_base);
+    if (!ch->kernel_stack_base) return -EIGEN_ERR_NOMEM;
+    ch->kernel_stack_top = abi_stack_top(ch->kernel_stack_base, KERNEL_STACK_SIZE);
+
+    /* Address-space copy under cli (same discipline as spawn). */
+    __asm__ volatile("cli" ::: "memory");
+    uint64_t new_pml4 = vmm_new_user_pml4();
+    if (!new_pml4) {
+        __asm__ volatile("sti" ::: "memory");
+        kfree((void*)ch->kernel_stack_base);
+        return -EIGEN_ERR_NOMEM;
+    }
+    if (copy_user_as(cur->pml4_phys, new_pml4) != 0) {
+        __asm__ volatile("sti" ::: "memory");
+        /* leak tables on OOM (tier-1) */
+        kfree((void*)ch->kernel_stack_base);
+        return -EIGEN_ERR_NOMEM;
+    }
+    ch->pml4_phys = new_pml4;
+
+    dup_fd_table(cur, ch);
+
+    /* Clone the parent's saved user frame onto the child's kernel stack.
+       The int80 stub pushes registers_t at a fixed depth below rsp0, so
+       copy [g_syscall_frame_rsp .. kernel_stack_top). */
+    extern uint64_t g_syscall_frame_rsp;
+    uint64_t parent_frame = g_syscall_frame_rsp;
+    size_t frame_bytes = (size_t)(cur->kernel_stack_top - parent_frame);
+    if (frame_bytes > KERNEL_STACK_SIZE) frame_bytes = sizeof(registers_t);
+    uint64_t child_frame = ch->kernel_stack_top - frame_bytes;
+    memcpy((void*)child_frame, (void*)parent_frame, frame_bytes);
+
+    registers_t* fr = (registers_t*)child_frame;
+    fr->rax = 0;                       /* child sees fork() == 0 */
+    ch->rsp = child_frame;
+    ch->fs_base = cur->fs_base;
+    ch->cwd_node = cur->cwd_node;
+    ch->user_stack_base = cur->user_stack_base;
+    ch->user_stack_top = cur->user_stack_top;
+    ch->state = TASK_READY;
+    __asm__ volatile("sti" ::: "memory");
+    return ch->id;
+}
+
+/* execve(path, argv, envp): replace the CALLING task's image in place. The
+   int80 return path pops the mutated saved frame and iretq's straight into
+   the new program at its entry point. Old address space is leaked (tier-1:
+   add vmm_destroy_pml4 later). */
+long sys_execve(const char* path_u, char* const argv_u[], char* const envp_u[]) {
+    task_t* cur = get_current_task();
+    if (!cur || cur->ring != TASK_RING3 || !path_u || !path_u[0]) return -EIGEN_ERR_INVAL;
+
+    /* copy path from user memory (we ARE in the user's address space) */
+    char path[256];
+    size_t pl = 0;
+    while (path_u[pl] && pl < sizeof(path)-1) { path[pl] = path_u[pl]; pl++; }
+    path[pl] = 0;
+
+    /* read the ELF through the flat fs table */
+    int idx = fs_open(path, 0);
+    if (idx < 0) return -EIGEN_ERR_NOENT;
+    int sz = 0;
+    fs_get_node(idx, 0, &sz, 0, 0, 0, 0);
+    if (sz <= 0 || sz > 32*1024*1024) { fs_close(idx); return -EIGEN_ERR_NOMEM; }
+
+    static uint8_t elfbuf[8*1024*1024]; /* shared staging buffer; cli guards it */
+    int got = fs_read_at(idx, (char*)elfbuf, sz, 0);
+    fs_close(idx);
+    if (got != sz) return -EIGEN_ERR_NOENT;
+
+    /* count argv/envp (user pointers valid now, before we switch CR3) */
+    int nargs = 0, nenv = 0;
+    size_t slen = pl + 1;
+    if (argv_u) while (argv_u[nargs]) {
+        const char* s = argv_u[nargs]; size_t l=0; while (s[l]) l++;
+        slen += l+1; nargs++;
+        if (nargs >= 63) break;
+    } else slen += pl + 1;
+    if (envp_u) while (envp_u[nenv]) {
+        const char* s = envp_u[nenv]; size_t l=0; while (s[l]) l++;
+        slen += l+1; nenv++;
+        if (nenv >= 63) break;
+    }
+
+    __asm__ volatile("cli" ::: "memory");
+    uint64_t new_pml4 = vmm_new_user_pml4();
+    if (!new_pml4) { __asm__ volatile("sti" ::: "memory"); return -EIGEN_ERR_NOMEM; }
+    uint64_t old_cr3 = vmm_get_current_pml4();
+    (void)old_cr3;
+    vmm_activate_pml4(new_pml4);
+    cur->pml4_phys = new_pml4;
+
+    uint64_t entry = 0;
+    if (elf_load(elfbuf, sz, &entry) != 0) {
+        klog("[EXECVE] elf_load failed");
+        __asm__ volatile("sti" ::: "memory");
+        return -EIGEN_ERR_NOENT;
+    }
+
+    /* fresh user stack */
+    uint64_t ustack_pages = USER_STACK_SIZE / 4096;
+    for (uint64_t p = 0; p < ustack_pages; p++) {
+        uint64_t phys = pmm_alloc();
+        if (!phys) break;
+        vmm_map_range(USER_STACK_VADDR + p*4096, phys, 4096,
+                      VMM_PRESENT | VMM_WRITE | VMM_USER);
+        memset((void*)(uintptr_t)(USER_STACK_VADDR + p*4096), 0, 4096);
+    }
+    cur->user_stack_base = USER_STACK_VADDR;
+    cur->user_stack_top  = USER_STACK_VADDR + USER_STACK_SIZE;
+
+    /* fresh TLS page (same per-slot layout as spawn) */
+    uint64_t tls_vaddr = THREAD_TLS_VADDR + (uint64_t)(cur - tasks) * 0x1000;
+    uint64_t tls_phys = pmm_alloc();
+    if (tls_phys) {
+        vmm_map_range(tls_vaddr, tls_phys, 4096, VMM_PRESENT | VMM_WRITE | VMM_USER);
+        memset((void*)(uintptr_t)tls_vaddr, 0, 4096);
+        *(uint64_t*)(uintptr_t)(tls_vaddr + THREAD_TLS_SELF_OFF) = (uint64_t)cur->id;
+        *(uint64_t*)(uintptr_t)tls_vaddr = tls_vaddr;
+        cur->fs_base = tls_vaddr;
+    }
+    extern void wrmsr(uint32_t msr, uint64_t val);
+    wrmsr(0xC0000100, cur->fs_base);
+
+    /* stack layout: [argc][argv...][NULL][envp...][NULL][auxv AT_NULL pair]
+       then strings above — matches musl _start expectations. */
+    uint64_t top = cur->user_stack_top;
+    size_t total = slen + (size_t)(nargs + nenv + 5) * 8 + 64;
+    uint64_t arr = (top - total) & ~(uint64_t)15;
+    arr += 8;
+    uint64_t* a = (uint64_t*)arr;
+    uint64_t sp = top - slen;
+    /* argv[0] is the path itself when argv absent */
+    a[0] = (uint64_t)(nargs + 1);
+    a[1] = sp;                                   /* argv[0] = path string */
+    sp += pl + 1;
+    uint64_t wi = 2;
+    for (int i = 0; i < nargs; i++) {
+        const char* s = argv_u[i]; size_t l = 0; while (s[l]) l++;
+        for (size_t j = 0; j <= l; j++) ((char*)sp)[j] = s[j];
+        a[wi++] = sp; sp += l + 1;
+    }
+    a[wi++] = 0;                                  /* argv NULL */
+    uint64_t envp_base = wi;
+    wi += nenv + 1;                               /* reserve env block incl NULL */
+    a[wi++] = 0; a[wi++] = 0;                     /* auxv: AT_NULL pair */
+    /* fill env pointers AFTER their strings exist */
+    uint64_t esp = sp;
+    if (nenv) {
+        /* strings for env go after argv strings */
+        for (int i = 0; i < nenv; i++) {
+            const char* s = envp_u[i]; size_t l = 0; while (s[l]) l++;
+            for (size_t j = 0; j <= l; j++) ((char*)esp)[j] = s[j];
+            a[envp_base + i] = esp; esp += l + 1;
+        }
+    }
+    a[envp_base + nenv] = 0;
+
+    /* Mutate the CURRENT syscall frame in place: on int80 return the CPU
+       iretq's directly into the new image. */
+    extern uint64_t g_syscall_frame_rsp;
+    registers_t* fr = (registers_t*)g_syscall_frame_rsp;
+    for (int i = 0; i < 15; i++) ((uint64_t*)fr)[i] = 0;
+    fr->rip = entry;
+    fr->rsp = arr;                 /* %rsp ≡ 8 (mod 16): SysV entry state */
+    fr->cs = 0x1B;
+    fr->ss = 0x23;
+    fr->rflags = 0x202;
+
+    cur->state = TASK_RUNNING;
+    __asm__ volatile("sti" ::: "memory");     /* iretq restores IF anyway */
+    return 0;                                  /* never actually returns */
+}
+
+long sys_wait4(int pid, int* status, int options) {
+    (void)options;
+    task_t* cur = get_current_task();
+    if (!cur) return -1;
+    for (;;) {
+        for (int i = 0; i < MAX_TASKS; i++) {
+            task_t* t = &tasks[i];
+            if (t->state == TASK_DEAD) continue;
+            if (t->ppid != cur->id) continue;
+            if (pid > 0 && t->id != pid) continue;
+            int code = t->exit_code;
+            if (status)
+                *status = (code << 8);         /* WEXITSTATUS layout */
+            int rpid = t->id;
+            t->state = TASK_FREE;      /* reap: slot reusable (stack already
+                                          handled by exit_task) */
+            return rpid;
+        }
+        sleep_task(10);
+    }
+}
+
+/* linux_dirent64 layout musl getdents64 expects. */
+struct eigen_dirent64 {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+};
+
+extern file_t* fs_table_entry(int i);
+
+long sys_getdents64(int fd, void* ubuf, unsigned int count) {
+    task_t* cur = get_current_task();
+    if (!cur || fd < 0 || fd >= MAX_FDS || !ubuf) return -EIGEN_ERR_INVAL;
+    if (cur->fd_flags[fd] <= 0) return -EBADF;      /* need a files[] fd */
+    int dir = cur->fd_flags[fd] - 1;
+
+    extern int fs_get_dir_count(int dir_idx);
+    extern int fs_find_by_index(int dir_idx, int nth, char* name,
+                                int* size, int* type, uint8_t* flags,
+                                uint32_t* mod_time);
+
+    uint32_t start = cur->fd_offsets[fd];           /* entries already emitted */
+    uint32_t emitted = 0;
+    char name[128]; int size = 0; int type = 0;
+    uint64_t nth = start;
+    for (;; nth++) {
+        name[0] = 0;
+        if (fs_find_by_index(dir, (int)nth, name, &size, &type, 0, 0) != 0)
+            break;                                   /* past last child */
+        if (!name[0]) continue;
+        uint16_t nl = 0; while (name[nl]) nl++;
+        uint16_t reclen = (uint16_t)(19 + nl + 1);
+        reclen = (uint16_t)((reclen + 7) & ~7u);
+        if (emitted + reclen > count) break;
+        struct eigen_dirent64* d = (void*)((char*)ubuf + emitted);
+        d->d_ino = nth + 2;
+        d->d_off = (int64_t)(nth + 1);
+        d->d_reclen = reclen;
+        d->d_type = (type == 1) ? 4 : 8;            /* DT_DIR / DT_REG */
+        for (uint16_t j = 0; j <= nl; j++) d->d_name[j] = name[j];
+        emitted += reclen;
+    }
+    cur->fd_offsets[fd] = (uint32_t)nth;
+    return (long)emitted;
+}
+
+struct iovec_e { void* iov_base; uint64_t iov_len; };
+
+long sys_readv(int fd, const struct iovec_e* iov, int iovcnt) {
+    if (!iov || iovcnt <= 0) return -EIGEN_ERR_INVAL;
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        long n = sys_read(fd, (char*)iov[i].iov_base, (uint32_t)iov[i].iov_len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint32_t)n < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+long sys_writev(int fd, const struct iovec_e* iov, int iovcnt) {
+    if (!iov || iovcnt <= 0) return -EIGEN_ERR_INVAL;
+    long total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        long n = sys_write(fd, (const char*)iov[i].iov_base, (uint32_t)iov[i].iov_len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint32_t)n < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+long sys_dup2(int oldfd, int newfd) {
+    task_t* cur = get_current_task();
+    if (!cur || oldfd < 0 || oldfd >= MAX_FDS) return -EBADF;
+    if (newfd < 0 || newfd >= MAX_FDS) return -EBADF;
+    if (oldfd == newfd) return newfd;
+    if (!cur->fd_types[oldfd] && !cur->fd_flags[oldfd] &&
+        !(cur->fd_types[oldfd])) {
+        /* FD_VFS==0 is ambiguous; treat empty slots as closed unless fds[] set */
+        if (!cur->fds[oldfd] && !cur->fd_flags[oldfd]) return -EBADF;
+    }
+    /* close target first (dup2 semantics) */
+    if (cur->fd_types[newfd] == FD_PIPE || cur->fd_types[newfd] == FD_PTY ||
+        cur->fds[newfd] || cur->fd_flags[newfd])
+        sys_close(newfd);
+    cur->fds[newfd]           = cur->fds[oldfd];
+    cur->fd_flags[newfd]      = cur->fd_flags[oldfd];
+    cur->fd_offsets[newfd]    = cur->fd_offsets[oldfd];
+    cur->fd_types[newfd]      = cur->fd_types[oldfd];
+    cur->fd_pipe[newfd]       = cur->fd_pipe[oldfd];
+    cur->fd_pty[newfd]        = cur->fd_pty[oldfd];
+    cur->fd_flags_extra[newfd]= cur->fd_flags_extra[oldfd];
+    /* extra refcounts for kernel objects */
+    if (cur->fd_types[newfd] == FD_PIPE) {
+        if (cur->fd_flags_extra[newfd] & 1) pipes[cur->fd_pipe[newfd]].writer_count++;
+        else                                pipes[cur->fd_pipe[newfd]].reader_count++;
+    } else if (cur->fd_types[newfd] == FD_PTY) {
+        extern void pty_dup_ref(int idx, int is_master);
+        pty_dup_ref(cur->fd_pty[newfd], cur->fd_flags_extra[newfd] & 1);
+    }
+    return newfd;
+}
+
+long sys_arch_prctl(long code, uint64_t addr) {
+    task_t* cur = get_current_task();
+    if (!cur) return -1;
+    switch (code) {
+    case 0x1001: /* ARCH_SET_GSBASE — unsupported */
+        return -EIGEN_ERR_INVAL;
+    case 0x1002: /* ARCH_SET_FS */
+        cur->fs_base = addr;
+        extern void wrmsr(uint32_t msr, uint64_t val);
+        wrmsr(0xC0000100, addr);
+        return 0;
+    case 0x1003: /* ARCH_GET_FS */
+        if (!addr) return -EIGEN_ERR_INVAL;
+        *(uint64_t*)(uintptr_t)addr = cur->fs_base;
+        return 0;
+    case 0x1004: /* ARCH_GET_GS */
+        if (!addr) return -EIGEN_ERR_INVAL;
+        *(uint64_t*)(uintptr_t)addr = 0;
+        return 0;
+    default:
+        return -EIGEN_ERR_INVAL;
+    }
+}
+
+long sys_set_tid_address(uint64_t tidptr) {
+    task_t* cur = get_current_task();
+    if (!cur) return -1;
+    cur->clear_child_tid = tidptr;
+    return cur->id;
+}
+
+/* ---- filesystem cwd bridge (used by filesystem.c) ---- */
+void* ktask_current(void) { return (void*)get_current_task(); }
+int   ktask_cwd_node(void* t) { return t ? ((task_t*)t)->cwd_node : 0; }
+int   ktask_set_cwd(int idx) {
+    task_t* cur = get_current_task();
+    if (!cur) return -1;
+    cur->cwd_node = idx < 0 ? 0 : idx;
+    return 0;
 }

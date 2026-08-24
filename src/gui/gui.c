@@ -23,6 +23,7 @@
 #include "gui/wm.h"
 #include "gui/icons.h"
 #include "gui/app_icons.h"
+#include "gui/ftfont.h"
 #include "kernel/security/security.h"
 #include "kernel/mem/kheap.h"
 #include "kernel/acpi.h"
@@ -93,12 +94,13 @@ static int g_menu_anim_closing = 0;  /* 1 while the close animation plays */
 
 /* ── Taskbar layout (live global) ── */
 static layout_t g_layout = {
-    1, 26, 255,     /* top, 26px, opaque */
-    1,              /* autohide on */
-    0,              /* monitor off (not used in Mac bar) */
-    0,              /* no clock (not used in Mac bar) */
-    0,              /* no toolbar (apps dropdown handles it) */
-    0, 0, 0, 0      /* monitor_w, acrylic, glow, search, bell (unused) */
+    1, 36, 255,     /* top, 36px, opaque — comprehensive top taskbar */
+    0,              /* autohide off (the bar is the shell hub) */
+    1,              /* live CPU/RAM monitor in the tray */
+    1,              /* clock shown */
+    1,              /* toolbar shown (desktop pills + window list) */
+    120,            /* monitor graph width */
+    1, 1, 0, 0      /* acrylic, glow, search pill, bell */
 };
 layout_t* gui_get_layout(void) { return &g_layout; }
 
@@ -107,18 +109,14 @@ void gui_get_work_area(int* wx, int* wy, int* ww, int* wh) {
     if (fw == 0 || fh == 0) { fw = 1024; fh = 768; }
     layout_t* L = &g_layout;
     int t_sz = L->size;
+    if (t_sz < 16) t_sz = 16;
     int x = 0, y = 0, w = (int)fw, h = (int)fh;
-    if (L->pos == 0) {        /* bottom */
-        h -= t_sz;
-    } else if (L->pos == 1) { /* top */
-        y += t_sz;
-        h -= t_sz;
-    } else if (L->pos == 2) { /* left */
-        x += t_sz;
-        w -= t_sz;
-    } else if (L->pos == 3) { /* right */
-        w -= t_sz;
-    }
+    /* The slim shell bar is rendered top-only (taskbar_mac.c). Reserve it
+     * unconditionally so a stale persisted layout can never resurrect the
+     * old phantom bottom strip. */
+    (void)L->pos;
+    y += t_sz;
+    h -= t_sz;
     if (wx) *wx = x;
     if (wy) *wy = y;
     if (ww) *ww = w;
@@ -157,7 +155,8 @@ void gui_sample_sysmon(void) {
     if (ram > 100) ram = 100; if (ram < 2) ram = 2;
     g_sysmon_ram = ram;
 }
-static int wallpaper_dirty = 1; // set to 1 to redraw wallpaper next frame
+static int wallpaper_dirty = 1;
+int g_last_wp_blit_ok = 0; // set to 1 to redraw wallpaper next frame
 void gui_set_wallpaper_dirty(void) { wallpaper_dirty = 1; }
 static int m_idx = 0;
 static int prev_mouse_btn = 0;
@@ -202,6 +201,8 @@ app_item_t menu_app_entries[] = {
     {"Settings", 0, 2, 98, "settings"},
     {"DOOM", 0, 3, 91, "doom"},
     {"File I/O Test", 0, 5, 93, "fiotest"},
+    {"EigenDeck", 0, 2, 62, "deck"},
+    {"EigenUI Demo", 0, 1, 99, "eigenui_demo"},
     {0, 0, 0, 0}
 };
 
@@ -219,6 +220,7 @@ const char* all_items[] = {
     "File I/O Test",
     "DOOM",
     "DVD Bounce",
+    "EigenUI Demo",
     0
 };
 
@@ -268,6 +270,10 @@ uint32_t get_theme_color(int id) {
 }
 
 void gui_system_shutdown() {
+    {
+        extern void persist_sync(const char*);
+        persist_sync("shutdown");
+    }
     uint32_t fw = get_fb_width(), fh = get_fb_height();
     gfx_fill_rect(0, 0, fw, fh, 0x000000);
     gfx_draw_string_transparent((fw-150)/2, (fh-16)/2, "SYSTEM SHUTDOWN", 0xFFFFFF);
@@ -346,9 +352,13 @@ static void render_wallpaper_to_cache(uint32_t fw, uint32_t fh) {
      * at the end snapshots it into wallpaper_cache. We render at the ACTUAL
      * screen size so the whole image is visible and fills the screen (no bars,
      * no letterbox). */
-    if (p->wallpaper_mode == 1 && p->wallpaper_file[0]) {
-        wallpaper_mgr_blit_active(bb, (int)stride, (int)fw, (int)fh);
+    extern int g_last_wp_blit_ok;
+    if ((p->wallpaper_mode == 1 && p->wallpaper_file[0]) ||
+        (p->wallpaper_mode == 2 && p->wallpaper_mod[0])) {
+        g_last_wp_blit_ok =
+            wallpaper_mgr_blit_active(bb, (int)stride, (int)fw, (int)fh);
     } else {
+        g_last_wp_blit_ok = 0;
 
     /* Base Gradient per Wallpaper Asset */
     uint32_t top_c = 0x141820, bot_c = 0x202530;
@@ -517,6 +527,21 @@ static void render_wallpaper_to_cache(uint32_t fw, uint32_t fh) {
 void draw_premium_wallpaper(void) {
     uint32_t fw = get_fb_width(), fh = get_fb_height();
     if (fw == 0 || fh == 0) return;
+
+    /* Self-heal: if no file-mode wallpaper stuck yet (seed/boot race),
+       re-attempt the default pick every 2 s until it lands. */
+    {
+        static uint32_t last_try = 0;
+        personalization_t* p = get_personalization();
+        extern int g_last_wp_blit_ok;
+        if ((p->wallpaper_mode == 0 || !g_last_wp_blit_ok) &&
+            timer_get_ms() - last_try > 2000) {
+            last_try = timer_get_ms();
+            extern void wallpaper_mgr_apply_default(void);
+            wallpaper_mgr_apply_default();
+            if (p->wallpaper_mode == 1) gui_set_wallpaper_dirty();
+        }
+    }
 
     if (wallpaper_dirty) {
         /* Render wallpaper once into the cache buffer */
@@ -1022,276 +1047,6 @@ void draw_taskbar() {
  *   clicking an app launches it.
  * ───────────────────────────────────────────────────────────── */
 
-static void menu_anim_apply(int* oy, int* veil);
-static void menu_anim_finalize_close(void);
-static int menu_is_animating(void);
-
-static void menu_anim_apply(int* oy, int* veil) {
-    float p = gui_anim_progress(g_menu_anim_ms, MENU_ANIM_MS);   /* 0→1 */
-    /* ease-out so the motion is snappy then settles */
-    float e = p * (2.0f - p);
-    if (g_menu_anim_closing) { p = 1.0f - p; e = p * (2.0f - p); }
-    /* slide up into place on open (from ~70px below), slide back down on close */
-    int slide = 70;
-    *oy = (int)((1.0f - e) * (float)slide);
-    if (g_menu_anim_closing) *oy = -(int)((1.0f - e) * (float)slide);
-    /* veil/opacity fade for a clear open/close feel */
-    *veil = (int)((1.0f - e) * 150.0f);
-}
-
-static void menu_anim_finalize_close(void) {
-    if (g_menu_anim_closing &&
-        (int)(timer_get_ms() - g_menu_anim_ms) >= MENU_ANIM_MS) {
-        g_menu_anim_closing = 0;
-        g_st = 1;
-    }
-}
-
-/* 1 while the start/menu overlay is mid open/close animation; 0 once it has
-   settled. Used to skip the expensive drop-shadow while the menu just sits open. */
-static int menu_is_animating(void) {
-    if (g_menu_anim_closing) return 1;
-    float p = gui_anim_progress(g_menu_anim_ms, MENU_ANIM_MS);
-    return p < 1.0f;
-}
-
-static void render_menu(void) {
-    uint32_t fw = get_fb_width(), fh = get_fb_height();
-    int mw = 560, mh = 450;
-    int mx = 10, my = (int)fh - TASKBAR_H - mh - 10;
-    if (my < 10) my = 10;
-
-    uint32_t bg_main  = theme_get_color(THEME_ROLE_MENU_BG);
-    uint32_t text_clr = theme_get_color(THEME_ROLE_PRIMARY);
-    uint32_t sel_bg   = theme_get_color(THEME_ROLE_MENU_ITEM_SELECTED);
-    uint32_t hover_bg = theme_get_color(THEME_ROLE_MENU_ITEM_HOVER);
-    uint32_t muted    = theme_get_color(THEME_ROLE_SECONDARY);
-    uint32_t border   = theme_get_color(THEME_ROLE_OUTLINE);
-    uint32_t acc      = get_accent_color();   /* theme accent — makes the theme visibly apply */
-    int mx_m = mouse_get_x(), my_m = mouse_get_y();
-
-    gfx_draw_shadow(mx, my, mw, mh, 25);
-    gfx_fill_rect(mx, my, mw, mh, bg_main);
-    gfx_draw_rect_outline(mx, my, mw, mh, 1, border);
-
-    /* ── 1. Top Header with hostname ── */
-    int header_h = 36;
-    gfx_fill_rect(mx, my, mw, header_h, sel_bg);
-    gfx_draw_hline(mx, my + header_h, mw, border);
-    gfx_fill_rect(mx, my, 3, header_h, acc);   /* accent tab on the header */
-
-    gfx_draw_string_transparent(mx + 12, my + 11, get_hostname(), text_clr);
-    gfx_draw_string_transparent(mx + 80, my + 11, "Eigen OS 2.0", muted);
-
-    /* ── 2. Search Bar ── */
-    int search_y = my + header_h + 6;
-    int search_h = 26;
-    gfx_fill_rect(mx + 8, search_y, mw - 16, search_h, hover_bg);
-    gfx_draw_rect_outline(mx + 8, search_y, mw - 16, search_h, 1, border);
-    draw_search_icon(mx + 14, search_y + 5, 16, 16);
-
-    const char* s_disp = (start_search_len > 0) ? start_search_buf : "Type to filter...";
-    gfx_draw_string_transparent(mx + 34, search_y + 7, s_disp, (start_search_len > 0) ? text_clr : muted);
-
-    /* ── 3. Left Category Sidebar ── */
-    int side_x = mx + 8;
-    int side_y = search_y + search_h + 6;
-    int side_w = 120;
-    int side_h = mh - (side_y - my) - 8;
-
-    static const char* cat_names[8] = { "All Apps", "Productivity", "System", "Games", "Graphics", "Debug", "Accessibility", "Networking"};
-    for (int c = 0; c < 8; c++) {
-        int cy = side_y + c * 34;
-        int is_sel = (start_cat_idx == c);
-        int hover = point_in_rect(mx_m, my_m, side_x, cy, side_w, 28);
-        if (is_sel || hover)
-            gfx_fill_rect(side_x, cy, side_w, 28, hover ? hover_bg : sel_bg);
-        if (is_sel)
-            gfx_fill_rect(side_x, cy, 3, 28, acc);   /* accent bar on selected category */
-        gfx_draw_string_transparent(side_x + 10, cy + 8, cat_names[c], is_sel ? text_clr : muted);
-    }
-
-    gfx_draw_vline(side_x + side_w + 6, side_y, side_h, border);
-
-    /* ── 4. Right App Grid (scrollable) ── */
-    int grid_x = side_x + side_w + 12;
-    int grid_y = side_y;
-    int grid_w = mw - (grid_x - mx) - 8;
-    int grid_h = side_h;
-
-    int card_w = 118, card_h = 60;
-
-    int cols = (grid_w - 12) / (card_w + 6);
-    if (cols < 1) cols = 1;
-    int total_vis = 0;
-    if (start_search_len > 0) {
-        total_vis = search_result_count;
-    } else {
-        for (int i = 0; menu_app_entries[i].name != 0; i++) {
-            if (start_cat_idx != 0 && menu_app_entries[i].category != start_cat_idx) continue;
-            total_vis++;
-        }
-    }
-    int has_scroll = (total_vis * (card_h + 6) > grid_h + 24);
-    int scroll_h = has_scroll ? 16 : 0;
-    int max_rows = (grid_h - scroll_h) / (card_h + 6);
-    int max_vis = max_rows * cols;
-
-    /* Cache the visible grid page so the expensive draw_app_icon calls
-       (circles + gradients + shadows) run only when the page changes,
-       not every 16ms frame. Render once into a scratch buffer, then
-       memcpy it to the screen each frame and overlay the hover. */
-    static uint32_t* grid_cache = NULL;
-    static int       cache_valid = 0;
-    static uint32_t  cache_acc = 0;
-    static int       cache_cat = -1, cache_scroll = -1, cache_slen = -1;
-    int need_rebuild = !cache_valid
-                    || cache_acc != acc
-                    || cache_cat != start_cat_idx
-                    || cache_scroll != menu_scroll
-                    || cache_slen != start_search_len;
-    if (need_rebuild) cache_valid = 0;
-
-    if (!cache_valid) {
-        int cap = grid_w * grid_h;
-        if (!grid_cache) grid_cache = kmalloc(cap * (int)sizeof(uint32_t));
-        if (grid_cache) {
-            uint32_t* bb = gfx_get_back_buffer();
-            uint32_t stride = gfx_get_stride();
-            gfx_push_clip(grid_x, grid_y, grid_w, grid_h);
-            int vnow = 0;
-            for (int i = 0; menu_app_entries[i].name != 0; i++) {
-                if (start_search_len > 0) {
-                    const char* h = menu_app_entries[i].name;
-                    const char* n = start_search_buf;
-                    int match = 1;
-                    while (*n) {
-                        char a = *h, b = *n;
-                        if (a >= 'A' && a <= 'Z') a += 32;
-                        if (b >= 'A' && b <= 'Z') b += 32;
-                        if (a != b) { match = 0; break; }
-                        h++; n++;
-                    }
-                    if (!match) continue;
-                } else {
-                    if (start_cat_idx != 0 && menu_app_entries[i].category != start_cat_idx) continue;
-                }
-                if (vnow < menu_scroll) { vnow++; continue; }
-                if (vnow >= menu_scroll + max_vis) break;
-                int idx = vnow - menu_scroll;
-                int r = idx / cols, col = idx % cols;
-                int cx2 = grid_x + col * (card_w + 6);
-                int cy2 = grid_y + r * (card_h + 6);
-                gfx_fill_rect(cx2, cy2, card_w, card_h, bg_main);
-                draw_app_icon(menu_app_entries[i].name, cx2 + (card_w - 24) / 2, cy2 + 6);
-                char tt[16]; int j = 0;
-                while (menu_app_entries[i].name[j] && j < 13) { tt[j] = menu_app_entries[i].name[j]; j++; }
-                tt[j] = 0;
-                int tw = j * 8;
-                gfx_draw_string_transparent(cx2 + (card_w - tw) / 2, cy2 + 38, tt, text_clr);
-                vnow++;
-            }
-            for (int yy = 0; yy < grid_h; yy++) {
-                memcpy(&grid_cache[yy * grid_w],
-                       &bb[(grid_y + yy) * stride + grid_x],
-                       grid_w * sizeof(uint32_t));
-            }
-            gfx_fill_rect(grid_x, grid_y, grid_w, grid_h, bg_main);
-            gfx_pop_clip();
-            cache_acc = acc; cache_cat = start_cat_idx;
-            cache_scroll = menu_scroll; cache_slen = start_search_len;
-        }
-        cache_valid = 1;
-    }
-
-    /* Blit the cached page. */
-    if (grid_cache && cache_valid) {
-        uint32_t* bb = gfx_get_back_buffer();
-        uint32_t stride = gfx_get_stride();
-        for (int yy = 0; yy < grid_h; yy++) {
-            memcpy(&bb[(grid_y + yy) * stride + grid_x],
-                   &grid_cache[yy * grid_w],
-                   grid_w * sizeof(uint32_t));
-        }
-    }
-
-    /* Overlay hover highlight for the single card under the cursor. */
-    {
-        int vnow = 0;
-        for (int i = 0; menu_app_entries[i].name != 0; i++) {
-            if (start_search_len > 0) {
-                const char* h = menu_app_entries[i].name;
-                const char* n = start_search_buf;
-                int match = 1;
-                while (*n) {
-                    char a = *h, b = *n;
-                    if (a >= 'A' && a <= 'Z') a += 32;
-                    if (b >= 'A' && b <= 'Z') b += 32;
-                    if (a != b) { match = 0; break; }
-                    h++; n++;
-                }
-                if (!match) continue;
-            } else {
-                if (start_cat_idx != 0 && menu_app_entries[i].category != start_cat_idx) continue;
-            }
-            if (vnow < menu_scroll) { vnow++; continue; }
-            if (vnow >= menu_scroll + max_vis) break;
-            int idx = vnow - menu_scroll;
-            int r = idx / cols, col = idx % cols;
-            int cx2 = grid_x + col * (card_w + 6);
-            int cy2 = grid_y + r * (card_h + 6);
-            if (point_in_rect(mx_m, my_m, cx2, cy2, card_w, card_h)) {
-                gfx_fill_rect(cx2, cy2, card_w, card_h, hover_bg);
-                draw_app_icon(menu_app_entries[i].name, cx2 + (card_w - 24) / 2, cy2 + 6);
-                char tt[16]; int j = 0;
-                while (menu_app_entries[i].name[j] && j < 13) { tt[j] = menu_app_entries[i].name[j]; j++; }
-                tt[j] = 0;
-                int tw = j * 8;
-                gfx_draw_string_transparent(cx2 + (card_w - tw) / 2, cy2 + 38, tt, text_clr);
-            }
-            vnow++;
-        }
-    }
-
-    /* Scroll arrows */
-    if (has_scroll) {
-        int arr_y = grid_y + grid_h - 14;
-        if (menu_scroll > 0) {
-            int ha = point_in_rect(mx_m, my_m, grid_x, arr_y, 20, 12);
-            gfx_draw_string_transparent(grid_x, arr_y, "^", ha ? text_clr : muted);
-        }
-        if (menu_scroll < total_vis - max_vis) {
-            int hb = point_in_rect(mx_m, my_m, grid_x + grid_w - 20, arr_y, 20, 12);
-            gfx_draw_string_transparent(grid_x + grid_w - 20, arr_y, "v", hb ? text_clr : muted);
-        }
-    }
-
-    /* Mouse wheel scroll */
-    if (has_scroll) {
-        int wd = mouse_get_wheel_delta();
-        if (wd != 0) {
-            mouse_clear_wheel_delta();
-            menu_scroll -= wd;
-            if (menu_scroll < 0) menu_scroll = 0;
-            if (total_vis > max_vis && menu_scroll > total_vis - max_vis)
-                menu_scroll = total_vis - max_vis;
-            cache_valid = 0; /* page changed: rebuild next frame */
-        }
-    }
-
-    gfx_pop_clip();
-}
-
-/* ═══════════════════════════════════════════════════════
- * TASKBAR PINNED APPS SELECTOR MODAL (g_st == 21)
- * ═══════════════════════════════════════════════════════ */
-
-/* ═══════════════════════════════════════════════════════
-
-/* ═══════════════════════════════════════════════════════
- * TASKBAR PINNED APPS SELECTOR MODAL (g_st == 21)
- * ═══════════════════════════════════════════════════════ */
-
 /* ═══════════════════════════════════════════════════════
  * SOUND POPOVER PANEL (g_st == 22) — vertical volume editor
  * Opens when the speaker icon in the taskbar is clicked.
@@ -1611,202 +1366,6 @@ static void render_taskbar_layout_modal(void) {
     gfx_draw_string_transparent(mx + 16, my + mh - 16, "Tip: Super+D toggles the Dock", muted);
 }
 
-/* ═══════════════════════════════════════════════════════
- * SPOTLIGHT SEARCH OVERLAY
- * ═══════════════════════════════════════════════════════ */
-static void update_search_results(void) {
-    search_result_count = 0;
-    if (search_len == 0) {
-        for (int i = 0; all_items[i] && search_result_count < 32; i++)
-            search_results[search_result_count++] = i;
-    } else {
-        for (int i = 0; all_items[i] && search_result_count < 32; i++) {
-            const char *h = all_items[i], *n = search_buf; int m = 1;
-            while(*n) {
-                char a=*h, b=*n;
-                if(a>='A'&&a<='Z')a+=32; if(b>='A'&&b<='Z')b+=32;
-                if(a!=b){m=0;break;} h++;n++;
-            }
-            if(m) search_results[search_result_count++] = i;
-        }
-    }
-    search_sel = 0; search_scroll = 0;
-}
-
-static void render_search_panel(void) {
-    uint32_t fw = get_fb_width(), fh = get_fb_height();
-    int mw = 600, mh = 400;
-    int mx = (fw - mw) / 2;
-    int my = (fh - mh) / 2 - 40;
-
-    uint32_t bg_main  = theme_get_color(THEME_ROLE_MENU_BG);
-    uint32_t text_clr = theme_get_color(THEME_ROLE_PRIMARY);
-    uint32_t field_bg = theme_get_color(THEME_ROLE_MENU_BG);   /* input field = neutral surface, not the saturated selected color */
-    uint32_t sel_bg   = theme_get_color(THEME_ROLE_MENU_ITEM_SELECTED); /* selected result row */
-    uint32_t muted    = theme_get_color(THEME_ROLE_SECONDARY);
-    uint32_t border   = theme_get_color(THEME_ROLE_OUTLINE);
-
-    /* Cache the static parts (icons + row backgrounds) of the result strip
-       so we don't re-run draw_app_icon (circles + gradients + shadows) on
-       every 16ms frame. Only rebuild when the result set or selection
-       changes — i.e., when the user types or navigates results. The blinking
-       cursor + selection highlight are drawn on top each frame (cheap). */
-    static uint32_t* icon_strip = NULL;
-    static int       strip_valid = 0;
-    static int       last_buf0 = 0, last_slen = -1, last_cnt = -1, last_sel = -1, last_scr = -1;
-    int results_changed = (search_len != last_slen)
-                       || (search_result_count != last_cnt)
-                       || (search_result_count > 0
-                           && search_results[0] != last_buf0)
-                       || search_sel != last_sel
-                       || search_scroll != last_scr;
-
-    int input_h = 60;
-    int ry = my + input_h + 20;
-    int show_count = 6;
-
-    /* Rebuild the cached strip when the result set changes. */
-    if (results_changed) {
-        strip_valid = 0;
-        last_slen = search_len;
-        last_cnt = search_result_count;
-        last_buf0 = search_result_count > 0 ? search_results[0] : -1;
-        last_sel = search_sel;
-        last_scr = search_scroll;
-    }
-
-    if (!strip_valid) {
-        if (!icon_strip) {
-            icon_strip = kmalloc(mw * show_count * 48 * sizeof(uint32_t));
-        }
-        if (icon_strip) {
-            uint32_t* bb = gfx_get_back_buffer();
-            uint32_t stride = gfx_get_stride();
-            /* Render the strip (icons + row backgrounds) into the cache by
-               drawing directly then copying that rectangle out. */
-            int clip_h = mh - (ry - my) - 10;
-            int strip_w = mw;
-            int strip_h = show_count * 48;
-            if (strip_h > clip_h) strip_h = clip_h;
-
-            gfx_push_clip(mx + 10, ry, mw - 20, clip_h);
-            for (int i = 0; i < show_count && (i + search_scroll) < search_result_count; i++) {
-                int idx = i + search_scroll;
-                int iy = ry + i * 48;
-                /* row bg (unselected; selection drawn on top each frame) */
-                gfx_fill_rect(mx + 10, iy, mw - 36, 44, bg_main);
-                draw_app_icon(all_items[search_results[idx]], mx + 24, iy + 10);
-                gfx_draw_string_transparent(mx + 60, iy + 16,
-                    all_items[search_results[idx]], muted);
-            }
-            /* copy the strip region out, then clear it on screen so we can
-               blit the cache back cleanly and redraw only the highlight. */
-            for (int yy = 0; yy < strip_h; yy++) {
-                memcpy(&icon_strip[yy * strip_w],
-                       &bb[(ry + yy) * stride + (mx + 10)],
-                       mw * sizeof(uint32_t));
-            }
-            /* erase the just-rendered strip on screen */
-            for (int i = 0; i < show_count && (i + search_scroll) < search_result_count; i++) {
-                int iy = ry + i * 48;
-                gfx_fill_rect(mx + 10, iy, mw - 36, 44, bg_main);
-            }
-            gfx_pop_clip();
-        }
-        strip_valid = 1;
-    }
-
-    gfx_draw_shadow(mx, my, mw, mh, 40);
-    gfx_fill_rect(mx, my, mw, mh, bg_main);
-    gfx_draw_rect_outline(mx, my, mw, mh, 1, border);
-
-    int input_h_local = 60;
-    (void)input_h_local;
-    gfx_fill_rect(mx + 10, my + 10, mw - 20, input_h, field_bg);
-    gfx_draw_rect_outline(mx + 10, my + 10, mw - 20, input_h, 1, border);
-
-    draw_search_icon(mx + 22, my + 28, 20, 20);
-
-    char display_buf[64];
-    int start_pos = (search_len > 50) ? search_len - 50 : 0;
-    int k = 0;
-    while(k < 50 && search_buf[start_pos + k]) { display_buf[k] = search_buf[start_pos + k]; k++; }
-    display_buf[k] = 0;
-
-    gfx_draw_string_transparent(mx + 48, my + 26, display_buf, text_clr);
-
-    /* blinking cursor */
-    if ((timer_get_ms() / 500) % 2 == 0) {
-        int cx = mx + 48 + k * 8;
-        if (cx < mx + mw - 30) gfx_fill_rect(cx, my + 24, 2, 16, text_clr);
-    }
-
-    if (search_len == 0) {
-        gfx_draw_string_transparent(mx + 48, my + 26, "Type to search applications & files...", muted);
-    }
-
-    if (search_sel >= search_scroll + show_count) search_scroll = search_sel - show_count + 1;
-    if (search_sel < search_scroll) search_scroll = search_sel;
-
-    /* Blit the cached icon strip, then redraw just the selected row's
-       highlight + label (selected label is brighter). */
-    if (icon_strip && strip_valid) {
-        uint32_t* bb = gfx_get_back_buffer();
-        uint32_t stride = gfx_get_stride();
-        int strip_w = mw;
-        int strip_h = show_count * 48;
-        int clip_h = mh - (ry - my) - 10;
-        if (strip_h > clip_h) strip_h = clip_h;
-        for (int yy = 0; yy < strip_h; yy++) {
-            memcpy(&bb[(ry + yy) * stride + (mx + 10)],
-                   &icon_strip[yy * strip_w],
-                   mw * sizeof(uint32_t));
-        }
-    } else {
-        /* fallback: render directly (first paint / strip rebuild failure) */
-        gfx_push_clip(mx + 10, ry, mw - 20, mh - (ry - my) - 10);
-        for (int i = 0; i < show_count && (i + search_scroll) < search_result_count; i++) {
-            int idx = i + search_scroll;
-            int iy = ry + i * 48;
-            int is_sel = (search_sel == idx);
-            gfx_fill_rect(mx + 10, iy, mw - 36, 44, is_sel ? sel_bg : bg_main);
-            gfx_draw_rect_outline(mx + 10, iy, mw - 36, 44, 1, is_sel ? text_clr : border);
-            draw_app_icon(all_items[search_results[idx]], mx + 24, iy + 10);
-            gfx_draw_string_transparent(mx + 60, iy + 16, all_items[search_results[idx]],
-                                        is_sel ? text_clr : muted);
-        }
-        if (search_result_count == 0 && search_len > 0) {
-            gfx_draw_string_transparent(mx + mw / 2 - 60, ry + 40, "No matching applications found", muted);
-        }
-        gfx_pop_clip();
-    }
-
-    /* selection highlight on top of the cached strip */
-    if (icon_strip && strip_valid) {
-        int idx = search_sel - search_scroll;
-        if (idx >= 0 && idx < show_count) {
-            int iy = ry + idx * 48;
-            if ((search_scroll + idx) < search_result_count) {
-                gfx_fill_rect(mx + 10, iy, mw - 36, 44, sel_bg);
-                gfx_draw_rect_outline(mx + 10, iy, mw - 36, 44, 1, text_clr);
-                draw_app_icon(all_items[search_results[search_scroll + idx]], mx + 24, iy + 10);
-                gfx_draw_string_transparent(mx + 60, iy + 16,
-                    all_items[search_results[search_scroll + idx]], text_clr);
-            }
-        }
-    }
-}
-
-/* launch_item() is keyed by global_idx. The search results store indices into
- * the flat all_items[] list (whose order is unrelated to global_idx), so we
- * must translate the name -> global_idx here. This is what fixes "clicking a
- * search result opens the wrong app". */
-static void launch_search_result(int all_items_index) {
-    if (all_items_index < 0 || !all_items[all_items_index]) return;
-    int g = app_name_to_global_idx(all_items[all_items_index]);
-    if (g >= 0) launch_item(g);
-}
-
 void launch_item(int global_idx) {
     g_st = 1; search_open = 0; g_menu_anim_closing = 0;
     for (int i = 0; menu_app_entries[i].name != 0; i++) {
@@ -1874,7 +1433,7 @@ static void layout_write_all(const layout_t* live, const layout_t presets[4],
 
 void gui_apply_layout(const layout_t* l) {
     layout_t c = *l;
-    if (c.size < 24) c.size = 24; if (c.size > 96) c.size = 96;
+    if (c.size < 16) c.size = 16; if (c.size > 96) c.size = 96;
     if (c.opacity < 64) c.opacity = 64; if (c.opacity > 255) c.opacity = 255;
     if (c.monitor_w < 60) c.monitor_w = 60; if (c.monitor_w > 320) c.monitor_w = 320;
     if (c.pos < 0) c.pos = 0; if (c.pos > 3) c.pos = 0;
@@ -1996,58 +1555,25 @@ void gui_load_layout(void) {
     }
 }
 
-void gui_toggle_start_menu(void) {
-    search_open = 0;
-    if (g_st >= 2 && g_st <= 19) {
-        if (g_menu_anim_closing) {
-            /* Was in middle of closing animation: reverse & re-open */
-            g_menu_anim_closing = 0;
-            g_menu_anim_ms = timer_get_ms();
-        } else {
-            /* begin close animation; keep g_st in 2..19 until it finishes */
-            g_menu_anim_closing = 1;
-            g_menu_anim_ms = timer_get_ms();
-        }
-    } else {
-        g_st = 2;
-        g_menu_anim_closing = 0;
-        g_menu_anim_ms = timer_get_ms();
-        last_menu_open_ms = g_menu_anim_ms;
-        start_cat_idx = 0; start_search_len = 0; start_search_buf[0] = 0;
-    }
-}
+void gui_toggle_start_menu(void) { taskbar_menu_toggle(); }
 
 void gui_toggle_mute(void) { audio_set_mute(!audio_is_muted()); }
 int gui_is_audio_hovered(int x, int y, int w, int h) { return point_in_rect(x, y, x, y, w, h); }
-void gui_open_search(void) { g_st = 1; search_open = 1; search_len = 0; search_buf[0] = 0; search_sel = 0; update_search_results(); last_menu_open_ms = timer_get_ms(); }
-void gui_toggle_search(void) { if (search_open) search_open = 0; else gui_open_search(); }
-int gui_is_menu_open(void) { return (g_st >= 2 && g_st <= 19); }
-int gui_is_search_open(void) { return search_open; }
-int gui_is_overlay_open(void) { return (g_st >= 2 && g_st <= 22) || search_open; }
-int gui_is_topbar_cfg_open(void) { return 0; }
+
+/* ── Overlay API (now backed by the taskbar launcher) ─────────
+ * The old start menu and spotlight search are gone. The launcher
+ * panel in taskbar_mac.c is the single app launcher; these hooks
+ * keep wm.c / apps working unchanged.                          */
+void gui_open_search(void) { taskbar_launcher_open_search(); }
+void gui_toggle_search(void) { taskbar_launcher_open_search(); }
+int  gui_is_menu_open(void) { return taskbar_overlay_open(); }
+int  gui_is_search_open(void) { return 0; }
+int  gui_is_overlay_open(void) { return taskbar_overlay_open() || g_st >= 20; }
+int  gui_is_topbar_cfg_open(void) { return 0; }
 void gui_handle_topbar_cfg_key(char key) { (void)key; }
 
-void gui_handle_menu_key(char key_in) {
-    unsigned char key = (unsigned char)key_in;
-    if (g_st < 2 || g_st > 19) return;
-    if (key == 27) { g_st = 1; }
-    else if (key == '\b') {
-        if (start_search_len > 0) { start_search_buf[--start_search_len] = 0; }
-    } else if (key >= 32 && key <= 126 && start_search_len < 60) {
-        start_search_buf[start_search_len++] = (char)key;
-        start_search_buf[start_search_len] = 0;
-    }
-}
-
-void gui_handle_search_key(char key_in) {
-    unsigned char key = (unsigned char)key_in; if (!search_open) return;
-    if (key == 27) { search_open = 0; return; }
-    else if (KEY_MATCH(key, '\b')) { if (search_len > 0) { search_buf[--search_len] = 0; update_search_results(); } }
-    else if (KEY_MATCH(key, KEY_UP)) { if (search_sel > 0) search_sel--; }
-    else if (KEY_MATCH(key, KEY_DOWN)) { if (search_sel < search_result_count - 1) search_sel++; }
-    else if (key == '\n' && search_result_count > 0) launch_search_result(search_results[search_sel]);
-    else if (key >= 32 && key <= 126 && search_len < 62) { search_buf[search_len++] = (char)key; search_buf[search_len] = 0; update_search_results(); }
-}
+void gui_handle_menu_key(char key_in) { taskbar_handle_key(key_in); }
+void gui_handle_search_key(char key_in) { taskbar_handle_key(key_in); }
 
 /* ════════════════════════════════════════════════════════════════════════
  * DESKTOP ICON SYSTEM
@@ -2058,7 +1584,7 @@ void gui_handle_search_key(char key_in) {
 #define DESK_PAD_X    12   /* left edge of grid */
 #define DESK_PAD_Y    20   /* top  edge of grid */
 #define DESK_GRID_C   2    /* number of columns */
-#define DESK_TILE_SZ  48   /* icon glyph tile   */
+#define DESK_TILE_SZ  64   /* big Nordzy tile   */
 #define DESK_MAX_ITEMS 64
 
 typedef struct {
@@ -2279,23 +1805,39 @@ static void draw_desk_file_icon(const char* name, int gx, int gy) {
 
 /* ── draw one icon (without the cell bg) ──────────────────────────────── */
 static void desk_draw_icon_contents(int k, int ox, int oy, int sel, uint32_t acc) {
+    (void)acc;
     int gx = ox + (DESK_ICON_W - DESK_TILE_SZ) / 2;
-    int gy = oy + 6;
+    int gy = oy + 4;
+
+    int mx = mouse_get_x(), my = mouse_get_y();
+    int hovr = (mx >= ox && mx < ox + DESK_ICON_W &&
+                my >= oy && my < oy + DESK_ICON_H);
+
+    /* extremely modern: zero chrome — soft wash only when touched */
+    if (sel)         gfx_fill_rect_alpha(ox, oy, DESK_ICON_W, DESK_ICON_H, 0xFFFFFF, 22);
+    else if (hovr)   gfx_fill_rect_alpha(ox, oy, DESK_ICON_W, DESK_ICON_H, 0xFFFFFF, 12);
+
     if (g_desk_items[k].is_file) {
         draw_desk_file_icon(g_desk_items[k].name, gx, gy);
     } else {
-        draw_app_icon(g_desk_items[k].name,
-                      gx + (DESK_TILE_SZ - 24) / 2,
-                      gy + (DESK_TILE_SZ - 24) / 2);
+        draw_app_icon_tile(g_desk_items[k].name, gx, gy, DESK_TILE_SZ,
+                           sel ? 1 : 0, get_accent_color());
     }
+
+    /* tiny label under a big icon */
     char sn[20];
-    desk_shorten_name(g_desk_items[k].name, sn, 10);
-    int lw = (int)strlen(sn) * 8;
-    int lx = ox + (DESK_ICON_W - lw) / 2;
-    int ly = oy + 6 + DESK_TILE_SZ + 4;
-    gfx_draw_string_transparent(lx+1, ly+1, sn, 0x000000);
-    gfx_draw_string_transparent(lx,   ly,   sn, sel ? 0xFFFFFF : 0xDDE0E8);
-    (void)acc;
+    desk_shorten_name(g_desk_items[k].name, sn, 12);
+    int ly = oy + 4 + DESK_TILE_SZ + 5;
+    if (ftfont_ready()) {
+        int lw = ftfont_width(sn, 10);
+        ftfont_draw_trunc(ox + (DESK_ICON_W - lw) / 2, ly,
+                          DESK_ICON_W - 4, sn,
+                          sel ? 0xFFFFFF : 0xC9CFDA, 10);
+    } else {
+        int lw = (int)strlen(sn) * 8;
+        int lx = ox + (DESK_ICON_W - lw) / 2;
+        gfx_draw_string_transparent(lx, ly, sn, sel ? 0xFFFFFF : 0xDDE0E8);
+    }
 }
 
 /* ── render ───────────────────────────────────────────────────────────── */
@@ -2528,6 +2070,22 @@ void desk_add_file_icon(const char* path, const char* name) {
 }
 
 void start_gui(void) {
+    /* Seed wallpapers from boot modules + rescan before anything reads them */
+    extern void wallpaper_mgr_init(void);
+    wallpaper_mgr_init();
+
+    {   /* persistent-root autosave daemon */
+        extern int  create_task(void (*entry)(void), const char* name);
+        extern void persistd_entry(void);
+        static int spawned = 0;
+        if (!spawned) {
+            spawned = 1;
+            extern void persist_force_first_save(void);
+            create_task(persistd_entry, "persistd");
+            persist_force_first_save();   /* guarantee a warm snapshot */
+        }
+    }
+
     theme_init();
     gui_running = 1; g_st = 1; search_open = 0; m_idx = 0; wm_init(); gfx_reset_clip();
     gui_load_layout();   /* restore persisted taskbar layout (cfg/layout.cfg) */
@@ -2589,23 +2147,10 @@ void start_gui(void) {
         }
         int click_handled = 0;
 
-        /* ── Taskbar geometry derived from g_layout (must match draw_taskbar) ── */
+        /* ── Taskbar geometry (top bar; matches taskbar_mac.c) ── */
         layout_t* L = &g_layout;
         int tb_h = L->size;
-        int tb_y = (L->pos == 1) ? 0 : (int)fh - tb_h; /* top or bottom (vertical not handled here) */
-        int taskbar_y = tb_y;   /* top edge of the bar (used by hit-rects) */
-
-        int mg2    = 4;
-        int start_bw = 36;
-        int sep1_x   = mg2 + start_bw + 4;
-        int desk_area_x = sep1_x + 6;
-        int desk_bw  = 24, desk_bh = tb_h - 8;
-        int desk_area_w2 = DESKTOP_COUNT * (desk_bw + 2);
-        int sep2_x   = desk_area_x + desk_area_w2 + 4;
-        int mid_x    = sep2_x + 6;
-        int right_rsv2 = 130 + mg2;
-        int snd_icon_x = (int)fw - right_rsv2 + 4;
-        int snd_icon_w = 32;
+        int tb_y = (L->pos == 1) ? 0 : (int)fh - tb_h;
 
         /* ── Right-click edge detection ── */
         int rclicked = (mbtn & 2) && !(prev_right_btn & 2);
@@ -2623,207 +2168,24 @@ void start_gui(void) {
         }
 
         if (clicked || rclicked) {
-            /* 0. Desktop App Icons (above the taskbar) — only if no window/overlay covers the spot */
+            /* 0. Taskbar + launcher panel own their regions first */
+            if (taskbar_handle_click(cx, cy, clicked, rclicked)) {
+                click_handled = 1;
+            }
+
+            /* 1. Desktop App Icons (only when nothing covers the spot) */
             int win_above = (wm_window_at_point(cx, cy) >= 0);
-            int overlay_above = (g_st >= 2 || search_open);
-            /* Desktop region = anywhere the taskbar is NOT covering vertically */
+            int overlay_above = taskbar_overlay_open() || g_st >= 20;
             int desktop_ok;
-            if (L->pos == 1)      desktop_ok = (cy > tb_h);                 /* top bar */
-            else if (L->pos == 0)  desktop_ok = (cy < (int)fh - tb_h);      /* bottom bar */
-            else                   desktop_ok = 1;                         /* vertical bars: full height desktop */
-            if (!click_handled && !win_above && !overlay_above && desktop_ok && desktop_click(cx, cy, clicked, rclicked)) {
-                click_handled = 1;
-            }
-            /* 1. Start Button Click */
-            if (!click_handled && point_in_rect(cx, cy, mg2, taskbar_y + 2, start_bw, tb_h - 4)) {
-                gui_toggle_start_menu(); g_st = gui_is_menu_open() ? g_st : 1;
-                search_open = 0; click_handled = 1;
-            }
-
-            /* 2. Desktop Switcher Clicks */
-            if (!click_handled) {
-                for (int i = 0; i < DESKTOP_COUNT; i++) {
-                    int dx = desk_area_x + i * (desk_bw + 2);
-                    int dy = taskbar_y + 4;
-                    if (point_in_rect(cx, cy, dx, dy, desk_bw, desk_bh)) {
-                        if (i == wm_get_current_desktop()) {
-                            int prev = wm_get_previous_desktop();
-                            if (prev != i) wm_set_current_desktop(prev);
-                        } else wm_set_current_desktop(i);
-                        click_handled = 1; break;
-                    }
-                }
-            }
-
-            /* 3. Pinned App Clicks */
-            if (!click_handled) {
-                personalization_t* p2 = get_personalization();
-                uint64_t pm2 = p2->taskbar_pinned_mask;
-                int pw2 = 32, cx3 = mid_x;
-                for (int i = 0; menu_app_entries[i].name != 0; i++) {
-                    int g_idx = menu_app_entries[i].global_idx;
-                    if (!(pm2 & (1ULL << g_idx))) continue;
-                    if (cx3 + pw2 >= (int)fw - right_rsv2 - 40) break;
-                    if (!click_handled && point_in_rect(cx, cy, cx3, taskbar_y + 2, pw2, tb_h - 4)) {
-                                int brought = 0;
-                                for (int w = 0; w < WM_MAX_WINDOWS; w++) {
-                                    wm_window_t* win = wm_get_window_by_index(w);
-                                    if (win && strstr(win->title, menu_app_entries[i].name)) {
-                                        wm_bring_to_front(win->id); brought = 1; break;
-                                    }
-                                }
-                                if (!brought) launch_item(g_idx);
-                            }
-                    cx3 += pw2 + 1;
-                }
-            }
-
-            /* 4. Open Window Tabs Click */
-            if (!click_handled) {
-                personalization_t* p2b = get_personalization();
-                uint64_t pm2b = p2b->taskbar_pinned_mask;
-                int ow = 0;
-                for (int i = 0; i < WM_MAX_WINDOWS; i++)
-                    if (wm_get_window_by_index(i)) ow++;
-                int tab_start = mid_x;
-                for (int i = 0; menu_app_entries[i].name != 0; i++) {
-                    int g_idx = menu_app_entries[i].global_idx;
-                    if (!(pm2b & (1ULL << g_idx))) continue;
-                    if (tab_start + 32 >= (int)fw - right_rsv2 - 40) break;
-                    tab_start += 33;
-                }
-                tab_start += 8;
-                int ta_w = (int)fw - tab_start - right_rsv2;
-                if (ta_w < 60) ta_w = 60;
-                int tw = 120;
-                if (ow > 0) {
-                    tw = ta_w / ow - 2;
-                    if (tw < 60) tw = 60;
-                    if (tw > 150) tw = 150;
-                }
-                int wx = tab_start;
-                int th2 = tb_h - 6;
-                int ty2 = taskbar_y + 3;
-                for (int i = 0; i < WM_MAX_WINDOWS; i++) {
-                    wm_window_t* win = wm_get_window_by_index(i);
-                    if (!win) continue;
-                    if (wx + tw > (int)fw - right_rsv2) break;
-                    if (point_in_rect(cx, cy, wx, ty2, tw, th2)) {
-                        if (wm_window_is_minimized(win->id))
-                            wm_restore_window(win->id);
-                        wm_bring_to_front(win->id);
-                        click_handled = 1; break;
-                    }
-                    wx += tw + 2;
-                }
-            }
-
-            /* 5. Sound Icon Click */
-            if (!click_handled && point_in_rect(cx, cy, snd_icon_x, taskbar_y + 2, snd_icon_w, tb_h - 4)) {
-                if (g_st == 22) g_st = 1;
-                else g_st = 22;
+            if (L->pos == 1)      desktop_ok = (cy > tb_h);             /* top bar */
+            else if (L->pos == 0) desktop_ok = (cy < (int)fh - tb_h);   /* bottom bar */
+            else                  desktop_ok = 1;
+            if (!click_handled && !win_above && !overlay_above && desktop_ok &&
+                desktop_click(cx, cy, clicked, rclicked)) {
                 click_handled = 1;
             }
 
-            /* 6. Click inside Sound Popover */
-            if (!click_handled && g_st == 22) {
-                int pw = 60, ph = 260;
-                int px = (int)fw - pw - 10;
-                int py = (int)fh - tb_h - ph - 6;
-                if (py < 4) py = 4;
-                if (!point_in_rect(cx, cy, px, py, pw, ph)) {
-                    g_st = 1;
-                }
-                click_handled = 1;
-            }
-
-            /* 7. Click inside Start Menu */
-            if (!click_handled && g_st >= 2 && g_st <= 19) {
-                int mw = 560, mh = 450;
-                int mx = 10, my = (int)fh - TASKBAR_H - mh - 10; if (my < 10) my = 10;
-                if (point_in_rect(cx, cy, mx, my, mw, mh)) {
-                    uint32_t fw = get_fb_width(), fh = get_fb_height();
-                    int header_h = 36;
-                    int search_h = 26;
-                    int search_y = my + header_h + 6;
-                    int side_x = mx + 8;
-                    int side_y = search_y + search_h + 6;
-                    int side_w = 120;
-                    int grid_x = side_x + side_w + 12;
-                    int grid_y = side_y;
-                    int grid_w = mw - (grid_x - mx) - 8;
-                    int grid_h = mh - (side_y - my) - 8;
-
-                    // Check Left Category Sidebar
-                    for (int c = 0; c < 8; c++) {
-                        int cy_c = side_y + c * 34;
-                        if (point_in_rect(cx, cy, side_x, cy_c, side_w, 28)) {
-                            start_cat_idx = c; menu_scroll = 0; click_handled = 1; break;
-                        }
-                    }
-
-                    // Scroll arrows
-                    if (!click_handled) {
-                        int card_w = 118, card_h = 60, cols = 3, gap = 6;
-                        int total_vis = 0;
-                        for (int i = 0; menu_app_entries[i].name != 0; i++) {
-                            if (start_search_len > 0) {
-                                const char* h = menu_app_entries[i].name;
-                                const char* n = start_search_buf;
-                                int match = 1;
-                                while (*n) { char a = *h, b = *n; if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32; if (a != b) { match = 0; break; } h++; n++; }
-                                if (!match) continue;
-                            } else {
-                                if (start_cat_idx != 0 && menu_app_entries[i].category != start_cat_idx) continue;
-                            }
-                            total_vis++;
-                        }
-                        int has_sc = (total_vis * (card_h + gap) > grid_h + 24);
-                        int scroll_h2 = has_sc ? 16 : 0;
-                        int rows_vis = (grid_h - scroll_h2) / (card_h + gap);
-                        int max_vis = rows_vis * cols;
-                        int arr_y = grid_y + grid_h - 14;
-                        if (menu_scroll > 0 && point_in_rect(cx, cy, grid_x, arr_y, 20, 12)) {
-                            menu_scroll = menu_scroll - rows_vis; if (menu_scroll < 0) menu_scroll = 0;
-                            click_handled = 1;
-                        }
-                        if (menu_scroll < total_vis - max_vis && point_in_rect(cx, cy, grid_x + grid_w - 20, arr_y, 20, 12)) {
-                            menu_scroll = menu_scroll + rows_vis; click_handled = 1;
-                        }
-                    }
-
-                     // Check Right Content App Cards Grid
-                    if (!click_handled) {
-                        int card_w = 118, card_h = 60, cols = 3, gap = 6;
-                        int v_idx = 0;
-                        for (int i = 0; menu_app_entries[i].name != 0; i++) {
-                            if (start_search_len > 0) {
-                                const char* h = menu_app_entries[i].name;
-                                const char* n = start_search_buf;
-                                int match = 1;
-                                while (*n) { char a = *h, b = *n; if (a >= 'A' && a <= 'Z') a += 32; if (b >= 'A' && b <= 'Z') b += 32; if (a != b) { match = 0; break; } h++; n++; }
-                                if (!match) continue;
-                            } else {
-                                if (start_cat_idx != 0 && menu_app_entries[i].category != start_cat_idx) continue;
-                            }
-                            if (v_idx < menu_scroll) { v_idx++; continue; }
-                            int idx = v_idx - menu_scroll;
-                            int r = idx / cols, col = idx % cols;
-                            int acx = grid_x + col * (card_w + gap);
-                            int acy = grid_y + r * (card_h + gap);
-                            if (point_in_rect(cx, cy, acx, acy, card_w, card_h)) {
-                                launch_item(menu_app_entries[i].global_idx);
-                                click_handled = 1; break;
-                            }
-                            v_idx++;
-                        }
-                    }
-                } else {
-                    g_st = 1;
-                }
-            }
-
-            /* 8. Click inside Taskbar Pins Selector Modal */
+            /* 2. Click inside Taskbar Pins Selector Modal (g_st == 21) */
             if (!click_handled && g_st == 21) {
                 int mw = 520, mh = 420;
                 int mx = (int)(fw - mw) / 2, my = (int)(fh - mh) / 2 - 20; if (my < 10) my = 10;
@@ -2836,7 +2198,6 @@ void start_gui(void) {
                     if (!click_handled && point_in_rect(cx, cy, btn_x, btn_y, btn_w, btn_h)) {
                         g_st = 1; click_handled = 1;
                     }
-                    // App cards: iterate all menu_app_entries
                     if (!click_handled) {
                         personalization_t* p = get_personalization();
                         int app_count = 0;
@@ -2847,7 +2208,6 @@ void start_gui(void) {
                         int start_idx = pp * cols * rows_per_page;
                         int end_idx = start_idx + cols * rows_per_page;
                         if (end_idx > app_count) end_idx = app_count;
-                        // Arrow clicks for pagination
                         int arr_y = my + mh - 40;
                         if (point_in_rect(cx, cy, mx + 12, arr_y, 20, 20)) { if (pp > 0) pp--; click_handled = 1; }
                         if (point_in_rect(cx, cy, mx + mw - 32, arr_y, 20, 20)) {
@@ -2871,25 +2231,7 @@ void start_gui(void) {
                 }
             }
 
-            /* 9. Spotlight Search Overlay Click */
-            if (!click_handled && search_open) {
-                int mw = 600, mh = 400;
-                int mx = (fw - mw) / 2, my = (fh - mh) / 2 - 40;
-                if (point_in_rect(cx, cy, mx, my, mw, mh)) {
-                    int ry = my + 80;
-                    int rel_y = cy - ry;
-                    if (rel_y >= 0) { 
-                        int idx = rel_y / 48; 
-                        int limit = (search_result_count < 6) ? search_result_count : 6;
-                        if (idx < limit && (idx + search_scroll) < search_result_count) {
-                            launch_search_result(search_results[idx + search_scroll]); 
-                        }
-                    }
-                } else search_open = 0;
-                click_handled = 1;
-            }
-
-            /* 8b. Click inside Taskbar Layout Modal (g_st == 23) */
+            /* 3. Click inside Taskbar Layout Modal (g_st == 23) */
             if (!click_handled && g_st == 23) {
                 int mw = 600, mh = 460;
                 int mx = (int)(fw - mw) / 2, my = (int)(fh - mh) / 2 - 20; if (my < 10) my = 10;
@@ -2897,21 +2239,15 @@ void start_gui(void) {
                     g_st = 1; click_handled = 1;
                 } else if (point_in_rect(cx, cy, mx, my, mw, mh)) {
                     click_handled = 1; /* consumed; internals handled by renderer */
+                } else {
+                    g_st = 1;
                 }
             }
 
-            if (!click_handled && (g_st >= 2 || search_open)) {
-                /* Debounce: the click that opened the menu (or search) is
-                   still latched on the very next frames, and during the open
-                   animation the menu hasn't slid to its final position yet,
-                   so the outside-click close would fire immediately and
-                   "close" a menu we just opened. Ignore it for MENU_ANIM_MS
-                   after an open so the opener click is consumed first. */
-                if ((int)(timer_get_ms() - last_menu_open_ms) < MENU_ANIM_MS) {
-                    click_handled = 1; /* swallow — it's the open click */
-                } else {
-                    g_st = 1; search_open = 0; click_handled = 1;
-                }
+            /* 4. Outside-click closes any open modal */
+            if (!click_handled && g_st >= 20) {
+                g_st = 1;
+                click_handled = 1;
             }
         }
 
@@ -2930,47 +2266,10 @@ void start_gui(void) {
         wm_user_cleanup_dead();  /* close user windows whose ring-3 task died */
 
 
-        gui_sample_sysmon();   /* refresh CPU/RAM for menu (still tracked) */
+        gui_sample_sysmon();   /* refresh CPU/RAM samples for the tray */
         draw_taskbar_mac();
-        if (g_st >= 2 && g_st <= 19) {
-            render_menu();
-            menu_anim_finalize_close();   /* complete a deferred close animation */
-        }
         if (g_st == 21) render_taskbar_pins_modal();
-        if (g_st == 22) render_sound_popover();
         if (g_st == 23) render_taskbar_layout_modal();
-        if (search_open) {
-            int wd = mouse_get_wheel_delta();
-            if (wd != 0) {
-                mouse_clear_wheel_delta();
-                search_scroll -= wd;
-                int max_scr = search_result_count - 6;
-                if (search_scroll < 0) search_scroll = 0;
-                if (search_scroll > max_scr) search_scroll = (max_scr > 0 ? max_scr : 0);
-            }
-            render_search_panel();
-        }
-
-        /* Wheel scroll for the Start Menu app grid (menu_scroll). Only the
-           focused overlay consumes the wheel per frame; wm_tick() already
-           handled window scrolling when no overlay was open. */
-        if (g_st >= 2 && g_st <= 19 && !search_open) {
-            int wd = mouse_get_wheel_delta();
-            if (wd != 0) {
-                mouse_clear_wheel_delta();
-                int card_h = 60, gap = 6, cols = 3;
-                int mw = 560, mh = 450;
-                int menu_y = (int)fh - TASKBAR_H - mh - 10; if (menu_y < 10) menu_y = 10;
-                int header_h = 36, search_h = 26;
-                int side_y = menu_y + header_h + 6 + search_h + 6;
-                int grid_h = mh - (side_y - menu_y) - 8;
-                int scroll_h2 = 16;
-                int rows_vis = (grid_h - scroll_h2) / (card_h + gap);
-                if (rows_vis < 1) rows_vis = 1;
-                menu_scroll += (wd > 0 ? -rows_vis : rows_vis);
-                if (menu_scroll < 0) menu_scroll = 0;
-            }
-        }
 
         mouse_draw_cursor();
         kerror_render();          /* non-fatal error toast (if any) */

@@ -293,6 +293,8 @@ static void wm_user_free_buffer(wm_window_t* win) {
    creation, so applying a resize never remaps: we only update the logical
    size, preserve the top-left content and clear newly-exposed pixels. */
 static void wm_user_mark_resize(wm_window_t* win, int cw, int ch) {
+    extern int send_signal(int pid, int sig);
+    if (win->user_pid > 0) send_signal(win->user_pid, 28 /*SIGWINCH*/);
     if (cw < 1) cw = 1;
     if (ch < 1) ch = 1;
     uint64_t max_px = USER_WIN_MAX_BUF / 4;
@@ -313,6 +315,16 @@ int wm_user_enqueue(int id, uint32_t type, int a, int b, int c, int d) {
     if (!win || !(win->flags & WM_FLAG_USER)) return -1;
     uint32_t next = (win->user_ev_tail + 1) % WM_USER_EV_QMAX;
     if (next == win->user_ev_head) return -1;   /* queue full */
+    /* Key events carry the live modifier bitmask in c so ring-3 apps
+       (lite-xl etc.) can see Shift/Ctrl/Alt without extra syscalls.
+       Bits: 1=shift 2=ctrl 4=alt. */
+    if (type == WM_USER_EV_KEY && !(a & 0x100)) {
+        int mods = 0;
+        if (keyboard_is_key_down(0x2A) || keyboard_is_key_down(0x36)) mods |= 1;
+        if (keyboard_is_key_down(0x1D) || keyboard_is_key_down(0x9D)) mods |= 2;
+        if (keyboard_is_key_down(0x38)) mods |= 4;
+        c = mods;
+    }
     wm_user_ev_t* e = &win->user_ev_q[win->user_ev_tail];
     e->type = type; e->a = a; e->b = b; e->c = c; e->d = d;
     win->user_ev_tail = next;
@@ -577,7 +589,8 @@ void wm_tile_all(void) {
     int master_w = aw * 55 / 100;
     int stack_x = ax + master_w + gap;
     int stack_w = aw - master_w - gap;
-    int stack_h = (ah - gap * (n - 1)) / n;
+    int stack_cnt = n - 1;                       /* windows right of master */
+    int stack_h  = stack_cnt > 0 ? (ah - gap * (stack_cnt - 1)) / stack_cnt : ah;
 
     wm_window_t* m = find_window(ids[0]);
     m->x = ax; m->y = ay; m->w = master_w; m->h = ah;
@@ -973,7 +986,7 @@ static void render_window(wm_window_t* win) {
      *   0 = Default : minimize LEFT, maximize+close RIGHT
      *   1 = Haiku   : single close on LEFT, plain rectangle (turns red)
      *   2 = XP      : min+max+close RIGHT, classic                   */
-    int btn_size = title_h - 12;   /* 20px square buttons */
+    int btn_size = title_h - 8;    /* square action buttons */
     if (btn_size < 14) btn_size = 14;
     int btn_y = y + (title_h - btn_size) / 2;
     int gap = 4;
@@ -988,9 +1001,13 @@ static void render_window(wm_window_t* win) {
         close_x = x + w - btn_size - 6;
         max_x   = close_x - btn_size - gap;
         min_x   = max_x - btn_size - gap;
-    } else {                             /* Default: min LEFT, max+close RIGHT */
+    } else if (tp.winbtn_layout == 3) {  /* Modern: whole cluster on the LEFT */
         min_x   = x + 6;
-        close_x = x + w - btn_size - 6;
+        max_x   = min_x + btn_size + gap;
+        close_x = max_x + btn_size + gap;
+    } else {                             /* Default: min far-LEFT, max+close far-RIGHT */
+        min_x   = x + 3;
+        close_x = x + w - btn_size - 3;
         max_x   = close_x - btn_size - gap;
     }
 
@@ -1006,6 +1023,9 @@ static void render_window(wm_window_t* win) {
     } else if (tp.winbtn_layout == 2) {   /* XP: all buttons on right */
         title_start = x + 12;
         title_end   = min_x - 8;
+    } else if (tp.winbtn_layout == 3) {   /* Modern: title starts after cluster */
+        title_start = close_x + btn_size + 8;
+        title_end   = x + w - 8;
     } else {                              /* Default: min left, max+close right */
         title_start = min_x + btn_size + 8;
         title_end   = max_x - 8;
@@ -1056,7 +1076,9 @@ static void render_window(wm_window_t* win) {
         uint32_t close_bg = close_hover ? chov : 0x1E1E24;
         uint32_t close_fg = close_hover ? 0xFFFFFF : 0xB7BECB;
         draw_tb_btn(close_x, btn_y, btn_size, close_bg, close_fg, &tp, 1);
-        gfx_draw_string_transparent(close_x + (btn_size - 8) / 2, btn_y + (btn_size - 16) / 2 + 1, "x", close_fg);
+        {   int ccx = close_x + btn_size / 2, ccy = btn_y + btn_size / 2;
+            gfx_draw_line(ccx - 3, ccy - 3, ccx + 3, ccy + 3, close_fg);
+            gfx_draw_line(ccx + 3, ccy - 3, ccx - 3, ccy + 3, close_fg); }
     }
 
     /* XP "glassy" sheen: subtle light line just under the title top edge */
@@ -1075,6 +1097,12 @@ static void render_window(wm_window_t* win) {
             gfx_draw_rect_outline(max_x + 4, btn_y + 4, btn_size - 8, btn_size - 8, 1, max_fg);
             gfx_draw_line(max_x + 4, btn_y + 4, max_x + btn_size - 7, btn_y + 4, max_fg);
             gfx_fill_rect(max_x + 6, btn_y + 6, btn_size - 12, 2, max_fg);
+        } else if (tp.winbtn_layout == 3) {
+            int cxm = max_x + btn_size / 2, cym = btn_y + btn_size / 2;
+            gfx_draw_line(cxm - 3, cym - 1, cxm,     cym - 4, max_fg);
+            gfx_draw_line(cxm + 3, cym - 1, cxm,     cym - 4, max_fg);
+            gfx_draw_line(cxm - 3, cym + 1, cxm,     cym + 4, max_fg);
+            gfx_draw_line(cxm + 3, cym + 1, cxm,     cym + 4, max_fg);
         } else {
             gfx_draw_rect_outline(max_x + 5, btn_y + 5, btn_size - 10, btn_size - 10, 1, max_fg);
         }
@@ -1083,7 +1111,10 @@ static void render_window(wm_window_t* win) {
         uint32_t min_bg = min_hover ? 0x3A3A40 : 0x1E1E24;
         uint32_t min_fg = min_hover ? 0xFFFFFF : 0xB7BECB;
         draw_tb_btn(min_x, btn_y, btn_size, min_bg, min_fg, &tp, 1);
-        gfx_draw_hline(min_x + 5, btn_y + btn_size / 2 + 1, btn_size - 10, min_fg);
+        {   /* minimize: down chevron */
+            int cxn = min_x + btn_size / 2, cyn = btn_y + btn_size / 2 + 1;
+            gfx_draw_line(cxn - 3, cyn - 2, cxn, cyn + 3, min_fg);
+            gfx_draw_line(cxn + 3, cyn - 2, cxn, cyn + 3, min_fg); }
     }
     (void)min_hover; (void)max_hover;
 
@@ -1259,11 +1290,15 @@ int wm_tick(void) {
                     ufw->user_lmx = relx;
                     ufw->user_lmy = rely;
                 }
-                if (snap_lc) wm_user_enqueue(ufw->id, WM_USER_EV_MDOWN, relx, rely, 1, 0);
-                if (snap_lr) wm_user_enqueue(ufw->id, WM_USER_EV_MUP, relx, rely, 1, 0);
-                if (snap_rc) wm_user_enqueue(ufw->id, WM_USER_EV_MDOWN, relx, rely, 2, 0);
-                if (snap_rr) wm_user_enqueue(ufw->id, WM_USER_EV_MUP, relx, rely, 2, 0);
             }
+            /* Button edges are delivered regardless of the cursor being
+             * inside the content rect — otherwise the FIRST click that
+             * focuses a window never reaches the app and ImGui apps
+             * need a second click before anything happens. */
+            if (snap_lc) wm_user_enqueue(ufw->id, WM_USER_EV_MDOWN, relx, rely, 1, 0);
+            if (snap_lr) wm_user_enqueue(ufw->id, WM_USER_EV_MUP, relx, rely, 1, 0);
+            if (snap_rc) wm_user_enqueue(ufw->id, WM_USER_EV_MDOWN, relx, rely, 2, 0);
+            if (snap_rr) wm_user_enqueue(ufw->id, WM_USER_EV_MUP, relx, rely, 2, 0);
         }
     }
 
@@ -1331,13 +1366,15 @@ int wm_tick(void) {
                     win->x = mx - win->drag_offset_x;
                     win->y = my - win->drag_offset_y;
                 }
-                /* Clamp to screen bounds */
-                if (win->x < 0) win->x = 0;
-                if (win->y < 0) win->y = 0;
-                int max_x = (int)fw - win->w;
-                if (win->x > max_x) win->x = max_x > 0 ? max_x : 0;
-                int max_y = (int)fh - TASKBAR_H - win->h;
-                if (win->y > max_y) win->y = max_y > 0 ? max_y : 0;
+                /* Clamp to the live work area (top shell bar reserved) */
+                int dwx, dwy, dww, dwh;
+                gui_get_work_area(&dwx, &dwy, &dww, &dwh);
+                if (win->x < dwx) win->x = dwx;
+                if (win->y < dwy) win->y = dwy;
+                int max_x = dwx + dww - win->w;
+                if (win->x > max_x) win->x = max_x > 0 ? max_x : dwx;
+                int max_y = dwy + dwh - win->h;
+                if (win->y > max_y) win->y = max_y > 0 ? max_y : dwy;
             } else win->flags &= ~WM_FLAG_DRAGGING;
         }
         if (win->flags & WM_FLAG_RESIZING) {
@@ -1359,7 +1396,9 @@ int wm_tick(void) {
                 if (win->h < WM_MIN_H) win->h = WM_MIN_H;
                 /* Clamp to screen */
                 if (win->w > (int)fw) win->w = (int)fw;
-                if (win->h > (int)fh - TASKBAR_H) win->h = (int)fh - TASKBAR_H;
+                {   int rwx,rwy,rww,rwh;
+                    gui_get_work_area(&rwx,&rwy,&rww,&rwh);
+                    if (win->h > rwh) win->h = rwh; }
                 win->content_w = win->w;
                 win->content_h = win->h - WM_TITLEBAR_H;
                 if (win->flags & WM_FLAG_USER)
@@ -1676,9 +1715,10 @@ void wm_minimize_window(int win_id) {
     /* Begin a shrink-toward-taskbar animation. The window stays logically
        where it is (so un-minimize restores correctly); WM_FLAG_MINIMIZED is
        set when the tween finishes (see wm_tick). */
-    uint32_t fh = get_fb_height();
+    int mwx, mwy, mww, mwh;
+    gui_get_work_area(&mwx, &mwy, &mww, &mwh);
     int tw = 64, th = 44;
-    int tx = win->x, ty = (int)fh - TASKBAR_H - th;
+    int tx = win->x, ty = mwy + mwh - th;
     win->anim_from_x = win->x; win->anim_from_y = win->y;
     win->anim_from_w = win->w; win->anim_from_h = win->h;
     win->anim_to_x = tx; win->anim_to_y = ty;

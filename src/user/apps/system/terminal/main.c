@@ -1,411 +1,342 @@
-/***************************************************************/
-/* Copyright (C) Sidney 2024-2026. All rights reserved.        */
-/***************************************************************/
-#include "userlib.h"
-#include <string.h>
+/* EigenOS Terminal — a real VT100/xterm-style emulator over a kernel PTY.
+ * The GUI side owns the pty master: it parses escape sequences into a cell
+ * grid with scrollback and forwards keyboard bytes to the line discipline.
+ * /bin/sh runs on the slave end. */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include "userlib.h"
+#include "eigen.h"
 
-/* EigenOS Terminal — pure text shell (ring 3).
- * The prompt lives on the LAST line of the scrollback, like a real
- * terminal: output pushes it up, PageUp/PageDown scroll history, the
- * prompt stays anchored at the bottom while editing. */
+#define WIN_W  660
+#define WIN_H  440
+#define COLS   80
+#define ROWS   24
+#define SB_LINES 400            /* scrollback capacity */
 
-#define WIN_W      760
-#define WIN_H      500
-#define MAX_EVS    64
-#define TERM_ROWS  512
-#define TERM_COLS  128
-#define HIST_SIZE  64
+/* palette: 0-7 normal, 8-15 bright */
+static const uint32_t pal[16] = {
+    0x2E3440, 0xBF616A, 0xA3BE8C, 0xEBCB8B,
+    0x81A1C1, 0xB48EAD, 0x88C0D0, 0xD8DEE9,
+    0x4C566A, 0xBF616A, 0xA3BE8C, 0xEBCB8B,
+    0x81A1C1, 0xB48EAD, 0x8FBCBB, 0xECEFF4
+};
+#define BG_DEF 0x2E3440
+#define FG_DEF 0xD8DEE9
 
-static int win_id = -1;
-static uint32_t* win_fb = NULL;
-static uint32_t cur_w = WIN_W, cur_h = WIN_H;
+typedef struct { uint32_t fg, bg; } style_t;
+typedef struct { char ch; uint32_t fg; uint32_t bg; } cell_t;
 
-static char    buf_text[TERM_ROWS][TERM_COLS];
-static uint32_t buf_color[TERM_ROWS];
-static int     buf_head = 0;
-static int     buf_count = 0;
-static int     scroll_off = 0;    /* lines scrolled back (0 = newest) */
+static int      win_id = -1;
+static uint32_t* win_fb;
+static int       cur_w = WIN_W, cur_h = WIN_H;
 
-static char    input[256];
-static int     input_len = 0;
+#define CHAR_W 8
+#define G_LINE 16
 
-static char    history[HIST_SIZE][256];
-static int     hist_count = 0;
-static int     hist_nav = -1;
+/* screen state */
+static cell_t   grid[ROWS][COLS];
+static int      cx, cy;                 /* cursor */
+static style_t  cur_st = { FG_DEF, BG_DEF };
+static int      scroll_top = 0, scroll_bot = ROWS - 1;
 
-static char    prompt[96] = "eigen@eigenos:/ $ ";
-static uint32_t last_blink_ms = 0;
-static int     cursor_visible = 1;
+/* scrollback: finished rows pushed here when scrolling up */
+static cell_t*  sb[SB_LINES];
+static int      sb_head = 0, sb_count = 0;
+static int      sb_off = 0;             /* how far back we're viewing */
 
-/* palette */
-static const uint32_t C_OUT   = 0xE6EDF3;   /* default output   */
-static const uint32_t C_DIR   = 0x58A6FF;   /* directories      */
-static const uint32_t C_ACC   = 0x7AA2F7;   /* prompts / info   */
-static const uint32_t C_OK    = 0x3FB950;   /* success          */
-static const uint32_t C_WARN  = 0xD29922;   /* warnings         */
-static const uint32_t C_ERR   = 0xF85149;   /* errors           */
-static const uint32_t C_DIM   = 0x8B949E;   /* faint            */
+/* pty */
+static int mfd = -1, sfd = -1;
+static int sh_pid = -1;
+static int blink_vis = 1;
 
-/* ── scrollback ─────────────────────────────────────────────── */
-static void buf_push(const char* text, uint32_t color) {
-    int row = buf_head % TERM_ROWS;
-    int n = 0;
-    while (text[n] && n < TERM_COLS - 1) { buf_text[row][n] = text[n]; n++; }
-    buf_text[row][n] = 0;
-    buf_color[row] = color;
-    buf_head++;
-    if (buf_count < TERM_ROWS) buf_count++;
-    scroll_off = 0;
+/* VT parser state machine */
+enum { P_GROUND, P_ESC, P_CSI };
+static int  pstate = P_GROUND;
+static char pb[32]; static int pb_len;
+static int  saved_cx, saved_cy;
+
+/* ------------------------------------------------------------------ */
+static void sb_push_row(void) {
+    if (!sb[sb_head]) sb[sb_head] = malloc(sizeof(cell_t) * COLS);
+    if (!sb[sb_head]) return;
+    memcpy(sb[sb_head], grid[0], sizeof(cell_t) * COLS);
+    sb_head = (sb_head + 1) % SB_LINES;
+    if (sb_count < SB_LINES) sb_count++;
 }
 
-/* push possibly multi-line output; long lines are wrapped */
-static void push_lines(const char* text, uint32_t color) {
-    if (!text || !*text) { buf_push("", color); return; }
-    char line[TERM_COLS];
-    int  li = 0;
-    const char* p = text;
-    while (*p) {
-        if (*p == '\n' || *p == '\r') {
-            line[li] = 0;
-            buf_push(line, color);
-            li = 0;
-            p++;
-            while (*p == '\r' || *p == '\n') p++;
-            continue;
-        }
-        if ((unsigned char)*p < 32 && *p != '\t') { p++; continue; }  /* strip control */
-        if (li >= TERM_COLS - 1) { line[li] = 0; buf_push(line, color); li = 0; }
-        line[li++] = *p++;
-    }
-    if (li > 0) { line[li] = 0; buf_push(line, color); }
-}
-
-/* strip \e[...m ANSI codes from the kernel's coloured fs_list output */
-static int strip_ansi(char* dst, const char* src, int max) {
-    int di = 0;
-    for (int si = 0; src[si] && di < max - 1; si++) {
-        if (src[si] == '\e') {
-            si++;
-            while (src[si] && src[si] != 'm') si++;
-            continue;
-        }
-        dst[di++] = src[si];
-    }
-    dst[di] = 0;
-    return di;
-}
-
-static void update_prompt(void) {
-    char cwd[128];
-    if (eigen_fs_pwd(cwd, sizeof(cwd)) == 0 && cwd[0]) {
-        int p = 0;
-        const char* pre = "eigen@eigenos:";
-        while (*pre && p < 60) prompt[p++] = *pre++;
-        int cl = 0; while (cwd[cl]) cl++;
-        int start = 0;
-        if (cl > 22) start = cl - 22;
-        for (int i = start; i < cl && p < 88; i++) prompt[p++] = cwd[i];
-        const char* suf = "$ ";
-        while (*suf && p < 95) prompt[p++] = *suf++;
-        prompt[p] = 0;
+static void grid_scroll_up(void) {
+    sb_push_row();
+    memmove(grid[0], grid[1], sizeof(cell_t) * (ROWS - 1) * COLS);
+    for (int x = 0; x < COLS; x++) {
+        grid[scroll_bot][x].ch = ' ';
+        grid[scroll_bot][x].fg = cur_st.fg;
+        grid[scroll_bot][x].bg = cur_st.bg;
     }
 }
-
-/* split cmd into whitespace-separated args (max 4) */
-static int split_args(const char* cmd, char args[][128]) {
-    int n = 0, i = 0;
-    while (cmd[i] && n < 4) {
-        while (cmd[i] == ' ' || cmd[i] == '\t') i++;
-        if (!cmd[i]) break;
-        int a = 0;
-        while (cmd[i] && cmd[i] != ' ' && cmd[i] != '\t' && a < 126) args[n][a++] = cmd[i++];
-        args[n][a] = 0;
-        n++;
+static void grid_scroll_down(void) {
+    memmove(&grid[1], &grid[0], sizeof(cell_t) * (ROWS - 1) * COLS);
+    for (int x = 0; x < COLS; x++) {
+        grid[0][x].ch = ' ';
+        grid[0][x].fg = cur_st.fg;
+        grid[0][x].bg = cur_st.bg;
     }
-    return n;
+}
+static void putc_cell(char c) {
+    if (cx >= COLS) { cx = 0; if (cy == scroll_bot) grid_scroll_up(); else cy++; }
+    grid[cy][cx].ch = c;
+    grid[cy][cx].fg = cur_st.fg;
+    grid[cy][cx].bg = cur_st.bg;
+    cx++;
 }
 
-static void cmd_ls(void) {
-    char raw[4096];
-    int len = eigen_fs_list(raw, sizeof(raw));
-    if (len <= 0) { buf_push("ls: nothing here", C_DIM); return; }
-    char line[TERM_COLS];
-    int li = 0, items = 0;
-    for (int i = 0; i < len && raw[i]; i++) {
-        if (raw[i] == '\n') {
-            line[li] = 0;
-            if (line[0]) {
-                char clean[128];
-                strip_ansi(clean, line, sizeof(clean));
-                int last = 0; while (clean[last]) last++;
-                buf_push(clean, last > 0 && clean[last - 1] == '/' ? C_DIR : C_OUT);
-                items++;
-            }
-            li = 0;
-            continue;
-        }
-        if (li < TERM_COLS - 1) line[li++] = raw[i];
-    }
-    if (items == 0) buf_push("ls: nothing here", C_DIM);
+static int idx_of(uint32_t color) {
+    for (int i = 0; i < 16; i++) if (pal[i] == color) return i % 8;
+    return 7;
 }
-
-static void cmd_cat(const char* file) {
-    if (!file[0]) { buf_push("cat: missing operand", C_ERR); return; }
-    static char data[4096];
-    int n = eigen_fs_read_file(file, data, sizeof(data) - 1);
-    if (n < 0) {
-        char msg[160];
-        snprintf(msg, sizeof(msg), "cat: %s: no such file", file);
-        buf_push(msg, C_ERR);
-        return;
-    }
-    data[n] = 0;
-    push_lines(data, C_OUT);
-}
-
-static void cmd_exec(const char* cmd) {
-    if (hist_count < HIST_SIZE) strncpy(history[hist_count++], cmd, 255);
-    hist_nav = -1;
-
-    char echo_line[300];
-    snprintf(echo_line, sizeof(echo_line), "%s%s", prompt, cmd);
-    buf_push(echo_line, C_OK);
-
-    char args[4][128];
-    int argc = split_args(cmd, args);
-    if (argc == 0) return;
-    const char* c = args[0];
-
-    if (strcmp(c, "clear") == 0) { buf_head = 0; buf_count = 0; scroll_off = 0; return; }
-    if (strcmp(c, "help") == 0) {
-        buf_push("Commands:", C_ACC);
-        buf_push("  ls               list files in the current directory", C_OUT);
-        buf_push("  cd <path>        change directory ('cd /' = root)", C_OUT);
-        buf_push("  pwd              print the current directory", C_OUT);
-        buf_push("  cat <file>       print a text file", C_OUT);
-        buf_push("  echo <text>      print text", C_OUT);
-        buf_push("  touch <file>     create an empty file", C_OUT);
-        buf_push("  rm <file>        delete a file", C_OUT);
-        buf_push("  mkdir <dir>      create a directory", C_OUT);
-        buf_push("  rmdir <dir>      remove a directory", C_OUT);
-        buf_push("  mv <src> <dst>   rename / move", C_OUT);
-        buf_push("  truncate <file>  empty an existing file", C_OUT);
-        buf_push("  sysinfo          system information", C_OUT);
-        buf_push("  time / date      current time and date", C_OUT);
-        buf_push("  clear            clear the screen", C_OUT);
-        buf_push("Apps: edim, file_explorer, settings, calculator, clock,", C_DIM);
-        buf_push("      calendar, weather, hexdump, process_viewer, doom, awk", C_DIM);
-        return;
-    }
-    if (strcmp(c, "ls") == 0) { cmd_ls(); return; }
-    if (strcmp(c, "pwd") == 0) {
-        char cwd[128];
-        eigen_fs_pwd(cwd, sizeof(cwd));
-        buf_push(cwd[0] ? cwd : "/", C_OUT);
-        return;
-    }
-    if (strcmp(c, "cd") == 0) {
-        if (argc < 2) { update_prompt(); return; }
-        if (eigen_fs_chdir(args[1]) == 0) update_prompt();
-        else {
-            char msg[160];
-            snprintf(msg, sizeof(msg), "cd: %s: no such directory", args[1]);
-            buf_push(msg, C_ERR);
-        }
-        return;
-    }
-    if (strcmp(c, "cat") == 0) { cmd_cat(argc > 1 ? args[1] : ""); return; }
-    if (strcmp(c, "echo") == 0) {
-        char out[TERM_COLS];
-        int o = 0;
-        for (int i = 1; i < argc && o < TERM_COLS - 2; i++) {
-            int k = 0; while (args[i][k] && o < TERM_COLS - 2) out[o++] = args[i][k++];
-            if (i < argc - 1 && o < TERM_COLS - 1) out[o++] = ' ';
-        }
-        out[o] = 0;
-        buf_push(out, C_OUT);
-        return;
-    }
-    if (strcmp(c, "touch") == 0) {
-        if (argc < 2) { buf_push("touch: missing operand", C_ERR); return; }
-        buf_push(eigen_fs_create(args[1]) == 0 ? "created" : "touch: could not create", C_OK);
-        return;
-    }
-    if (strcmp(c, "rm") == 0) {
-        if (argc < 2) { buf_push("rm: missing operand", C_ERR); return; }
-        buf_push(eigen_fs_delete(args[1]) == 0 ? "deleted" : "rm: could not delete", C_OK);
-        return;
-    }
-    if (strcmp(c, "mkdir") == 0) {
-        if (argc < 2) { buf_push("mkdir: missing operand", C_ERR); return; }
-        buf_push(eigen_mkdir(args[1]) == 0 ? "created" : "mkdir: could not create", C_OK);
-        return;
-    }
-    if (strcmp(c, "rmdir") == 0) {
-        if (argc < 2) { buf_push("rmdir: missing operand", C_ERR); return; }
-        buf_push(eigen_fs_rmdir(args[1]) == 0 ? "removed" : "rmdir: could not remove", C_OK);
-        return;
-    }
-    if (strcmp(c, "truncate") == 0) {
-        if (argc < 2) { buf_push("truncate: missing operand", C_ERR); return; }
-        buf_push(eigen_fs_truncate(args[1]) == 0 ? "truncated" : "truncate: no such file", C_OK);
-        return;
-    }
-    if (strcmp(c, "mv") == 0) {
-        if (argc < 3) { buf_push("mv: missing operand", C_ERR); return; }
-        buf_push(eigen_fs_rename(args[1], args[2]) == 0 ? "moved" : "mv: could not move", C_OK);
-        return;
-    }
-    if (strcmp(c, "sysinfo") == 0) {
-        struct eigen_sysinfo si;
-        if (eigen_sysinfo(&si) == 0) {
-            char line[TERM_COLS];
-            snprintf(line, sizeof(line), "EigenOS x86_64  |  api v%u  |  %u MB RAM  |  %u tasks",
-                     si.api_version, si.total_mem_kb / 1024, si.task_count);
-            buf_push(line, C_ACC);
-            snprintf(line, sizeof(line), "Screen %ux%u  |  uptime %u ms  |  timer %u Hz",
-                     si.screen_w, si.screen_h, si.uptime_ms, si.timer_hz);
-            buf_push(line, C_DIM);
-        }
-        return;
-    }
-    if (strcmp(c, "time") == 0 || strcmp(c, "date") == 0) {
-        int t[6];
-        eigen_time_get(t);
-        char line[64];
-        snprintf(line, sizeof(line), "%02d:%02d:%02d  (RTC)", t[0], t[1], t[2]);
-        buf_push(line, C_OUT);
-        return;
-    }
-    if (strcmp(c, "uname") == 0 || strcmp(c, "version") == 0) {
-        buf_push("EigenOS x86_64 | ring-3 shell | Copyright Sidney 2024-2026", C_ACC);
-        return;
-    }
-
-    const char* apps[] = {
-        "edim","file_explorer","edrowser","calculator","settings",
-        "weather","hexdump","process_viewer","clock","calendar",
-        "doom","awk","posixtest","ftglyph","pthreadtest","setjmptest","polltest","eintest","eotest","zlibtest","eettest","pngtest","jpegtest","ecoretest",NULL
-    };
-    for (int i = 0; apps[i]; i++) {
-        if (strcmp(c, apps[i]) == 0) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "Launching %s...", c);
-            buf_push(msg, C_WARN);
-            eigen_spawn(c);
-            return;
+static void csi_dispatch(char fin) {
+    int n[8] = {0}; int nn = 0; int def = 1;
+    for (int i = 0; i < pb_len && nn < 8; i++) {
+        if (pb[i] == ';') { n[nn++] = def ? 1 : n[nn]; def = 1; continue; }
+        if (pb[i] >= '0' && pb[i] <= '9') {
+            if (def) { n[nn++] = pb[i]-'0'; def = 0; }
+            else n[nn-1] = n[nn-1]*10 + (pb[i]-'0');
         }
     }
-
-    char err[128];
-    snprintf(err, sizeof(err), "bash: %s: command not found", c);
-    buf_push(err, C_ERR);
+    if (!nn) { n[0] = def ? 1 : n[0]; }
+    switch (fin) {
+    case 'A': cy -= n[0]; if (cy < 0) cy = 0; break;
+    case 'B': cy += n[0]; if (cy > scroll_bot) cy = scroll_bot; break;
+    case 'C': cx += n[0]; if (cx > COLS-1) cx = COLS-1; break;
+    case 'D': cx -= n[0]; if (cx < 0) cx = 0; break;
+    case 'H': case 'f':
+        cy = (n[0]?n[0]:1) - 1; cx = (n[1]?n[1]:1) - 1;
+        if (cy > scroll_bot) cy = scroll_bot; if (cy < 0) cy = 0;
+        if (cx > COLS-1) cx = COLS-1; if (cx < 0) cx = 0;
+        break;
+    case 'J':
+        if (n[0] == 2 || n[0] == 3 || !n[0] && pb_len == 0) {
+            for (int r = 0; r < ROWS; r++)
+                for (int c = 0; c < COLS; c++) {
+                    grid[r][c].ch=' '; grid[r][c].fg=FG_DEF; grid[r][c].bg=BG_DEF;
+                }
+        } else if (n[0] == 0)
+            for (int c = cx; c < COLS; c++){grid[cy][c].ch=' ';grid[cy][c].fg=cur_st.fg;}
+        else if (n[0] == 1)
+            for (int c = 0; c <= cx && c < COLS; c++){grid[cy][c].ch=' ';grid[cy][c].fg=cur_st.fg;}
+        break;
+    case 'K':
+        if (n[0]==0) for(int c=cx;c<COLS;c++){grid[cy][c].ch=' ';grid[cy][c].fg=cur_st.fg;}
+        else if(n[0]==1) for(int c=0;c<=cx;c++){grid[cy][c].ch=' ';grid[cy][c].fg=cur_st.fg;}
+        else for(int c=0;c<COLS;c++){grid[cy][c].ch=' ';grid[cy][c].fg=cur_st.fg;}
+        break;
+    case 'm': { /* SGR colors */
+        int i = 0;
+        if (pb_len == 0) { cur_st.fg = FG_DEF; cur_st.bg = BG_DEF; break; }
+        /* re-parse all params including empty ones */
+        int v[16], vn = 0; char tmp[8]; int ti = 0;
+        for (i = 0; i <= pb_len && vn < 16; i++) {
+            if (i == pb_len || pb[i] == ';') { tmp[ti]=0; v[vn++] = ti?atoi(tmp):0; ti=0; }
+            else if (ti < 7) tmp[ti++] = pb[i];
+        }
+        for (i = 0; i < vn; i++) {
+            int p = v[i];
+            if (p == 0) { cur_st.fg = FG_DEF; cur_st.bg = BG_DEF; }
+            else if (p == 1) { if (cur_st.fg < pal[8]) cur_st.fg = pal[(cur_st.fg==FG_DEF?7:idx_of(cur_st.fg))] ; }
+            else if (p >= 30 && p <= 37) cur_st.fg = pal[p-30];
+            else if (p >= 90 && p <= 97) cur_st.fg = pal[p-90+8];
+            else if (p >= 40 && p <= 47) cur_st.bg = pal[p-40];
+            else if (p >= 100 && p <= 107) cur_st.bg = pal[p-100+8];
+            else if (p == 39) cur_st.fg = FG_DEF;
+            else if (p == 49) cur_st.bg = BG_DEF;
+        }
+        break; }
+    case 's': saved_cx = cx; saved_cy = cy; break;
+    case 'u': cx = saved_cx; cy = saved_cy; break;
+    default: break;
+    }
 }
 
-/* ── rendering ───────────────────────────────────────────────── */
-static void render_all(void) {
-    if (!win_fb) return;
-    uint32_t bg = 0x0C0C0C;
-    eigen_draw_fillrect(win_fb, cur_w, cur_h, 0, 0, cur_w, cur_h, bg);
 
-    int row_h = 17, x0 = 10, y0 = 8, pad = 6;
-    int avail = (int)cur_h > y0 + pad + row_h ? (int)(cur_h - y0 - pad) / row_h : 2;
-    int hist_rows = avail - 1;              /* last row is the prompt */
-    int first = buf_count - hist_rows - scroll_off;
-    if (first < 0) first = 0;
-
-    for (int r = 0; r < hist_rows; r++) {
-        int ri = first + r;
-        if (ri >= buf_count) break;
-        int bidx = (buf_head - buf_count + ri + TERM_ROWS) % TERM_ROWS;
-        eigen_draw_text(win_fb, cur_w, cur_h, x0, y0 + r * row_h,
-                        buf_text[bidx], buf_color[bidx]);
+static void vt_feed(const char* s, int n) {
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (pstate == P_GROUND) {
+            if (c == 0x1B) { pstate = P_ESC; pb_len = 0; }
+            else if (c == '\r') cx = 0;
+            else if (c == '\n') { if (cy == scroll_bot) grid_scroll_up(); else cy++; }
+            else if (c == '\b') { if (cx) cx--; }
+            else if (c == '\t') { cx = (cx + 8) & ~7; if (cx >= COLS) cx = COLS-1; }
+            else if ((unsigned char)c >= 0x20) putc_cell(c);
+        } else if (pstate == P_ESC) {
+            if (c == '[') { pstate = P_CSI; pb_len = 0; }
+            else if (c == 'c') { /* full reset */
+                memset(grid, 0, sizeof(grid));
+                for (int r=0;r<ROWS;r++) for(int cc=0;cc<COLS;cc++){
+                    grid[r][cc].ch=' ';grid[r][cc].fg=FG_DEF;grid[r][cc].bg=BG_DEF;}
+                cur_st.fg = FG_DEF; cur_st.bg = BG_DEF; cx=cy=0; pstate=P_GROUND;
+            } else if (c == '7') { saved_cx=cx; saved_cy=cy; pstate=P_GROUND; }
+            else if (c == '8') { cx=saved_cx; cy=saved_cy; pstate=P_GROUND; }
+            else if (c == ')' || c == '(') { i++; pstate = P_GROUND; } /* charset */
+            else pstate = P_GROUND;
+        } else { /* CSI */
+            if ((unsigned char)c >= 0x40 && (unsigned char)c <= 0x7E &&
+                !(c >= '0' && c <= '9') && c != ';' && c != '?') {
+                csi_dispatch(c);
+                pstate = P_GROUND;
+            } else if (pb_len < 30) {
+                pb[pb_len++] = c;
+            } else pstate = P_GROUND;
+        }
     }
+}
 
-    int iy = y0 + hist_rows * row_h;
-    eigen_draw_text(win_fb, cur_w, cur_h, x0, iy, prompt, C_OK);
-    int px = x0 + (int)strlen(prompt) * 8;
-    eigen_draw_text(win_fb, cur_w, cur_h, px, iy, input, C_OUT);
-
-    /* Thin blinking text cursor — the prompt line is plain terminal text,
-       not an input bar, so the cursor is a slim vertical line like a real
-       terminal's, never a chunky block. */
-    uint32_t now = eigen_gettime_ms();
-    if (now - last_blink_ms > 500) { cursor_visible ^= 1; last_blink_ms = now; }
-    if (cursor_visible) {
-        int cx0 = px + input_len * 8;
-        eigen_draw_fillrect(win_fb, cur_w, cur_h, cx0, iy, 2, row_h, C_OK);
+/* ------------------------------------------------------------------ */
+/* rendering                                                            */
+static void draw_row_cells(int px, int py, cell_t* r) {
+    static char rowbuf[COLS+1];
+    int sx = 0;
+    while (sx < COLS) {
+        int ex = sx;
+        while (ex < COLS && r[ex].fg == r[sx].fg && r[ex].bg == r[sx].bg) ex++;
+        int len = ex - sx;
+        int k; for (k = 0; k < len; k++) rowbuf[k] = r[sx+k].ch;
+        rowbuf[k] = 0;
+        while (k > 0 && rowbuf[k-1]==' ') rowbuf[--k]=0;
+        if (k) eigen_draw_text(win_fb, cur_w, cur_h, px + sx*CHAR_W, py, rowbuf, r[sx].fg);
+        sx = ex;
     }
+}
 
+static void render_screen(void) {
+    eigen_draw_fillrect(win_fb, cur_w, cur_h, 0, 0, cur_w, cur_h, BG_DEF);
+
+    int pad = 8;
+    int view_rows = (cur_h - pad*2) / G_LINE;   /* rows that fit in the window */
+    if (view_rows > ROWS) view_rows = ROWS;
+
+    /* how many live grid rows are on-screen */
+    int sb_view = sb_off;                       /* user-requested history depth */
+    if (sb_view > sb_count) sb_view = sb_count;
+    if (sb_view > view_rows) sb_view = view_rows;
+    int live_vis = view_rows - sb_view;
+
+    int py = pad;
+    /* scrollback slice (oldest at top) */
+    for (int i = sb_view; i > 0; i--, py += G_LINE) {
+        int idx = (sb_head - i + SB_LINES*2) % SB_LINES;
+        if (!sb[idx]) continue;
+        draw_row_cells(pad, py, sb[idx]);
+    }
+    /* live grid: bottom `live_vis` rows */
+    int g0 = ROWS - live_vis;
+    for (int gr = g0; gr < ROWS; gr++, py += G_LINE)
+        draw_row_cells(pad, py, grid[gr]);
+
+    /* cursor */
+    if (sb_off == 0) {
+        static uint32_t blink_t = 0;
+        uint32_t now = eigen_gettime_ms();
+        if (now - blink_t > 500) { blink_vis ^= 1; blink_t = now; }
+        if (blink_vis && cy >= g0)
+            eigen_draw_fillrect(win_fb, cur_w, cur_h, pad + cx*CHAR_W,
+                                pad + sb_view*G_LINE + (cy-g0)*G_LINE,
+                                CHAR_W, G_LINE-1, 0x88C0D0);
+    }
     eigen_win_flush(win_id);
 }
 
+/* ------------------------------------------------------------------ */
+static void spawn_shell(void) {
+    int fds[2];
+    if (eigen_openpty(fds) != 0) return;
+    mfd = fds[0]; sfd = fds[1];
+
+    const char* argv[] = { "/user/sh.elf", NULL };
+    int inherit[3] = { sfd, sfd, sfd };
+    sh_pid = eigen_spawn_fds("/user/sh.elf", 1, (char* const*)argv, inherit);
+    /* diag goes to the pre-pty console (fd1 at terminal start) */
+    { char dbg[80]; int dn = snprintf(dbg,sizeof(dbg),
+        "[TERM] spawn pid=%d m=%d s=%d\n", sh_pid, mfd, sfd);
+      write(1, dbg, dn); }
+    if (sh_pid > 0) {
+        eigen_pty_setfg(mfd, sh_pid);
+        const char* banner = "\x1b[36mEigenOS shell\x1b[0m\r\n";
+        vt_feed(banner, (int)strlen(banner));
+    } else {
+        const char* err = "spawn /user/sh.elf failed\r\n";
+        vt_feed(err, (int)strlen(err));
+    }
+    close(sfd);          /* keep only master in the emulator */
+    sfd = -1;
+    fcntl(mfd, 4, 0x800); /* O_NONBLOCK reads */
+}
+
+static void send_key(eigen_ev_t* ev) {
+    if (mfd < 0) return;
+    char seq[8];
+    int code = ev->b, mods = ev->c;
+    char ch = (char)ev->a;
+
+    if ((mods & 2)) {                     /* ctrl */
+        if (ch=='c'||ch=='C'){ write(mfd,"\x03",1); return; }
+        if (ch=='d'||ch=='D'){ write(mfd,"\x04",1); return; }
+        if (ch=='u'||ch=='U'){ write(mfd,"\x15",1); return; }
+        if (ch=='l'||ch=='L'){ write(mfd,"\x0c",1); return; }
+    }
+    switch (code) {
+    case 0x48: write(mfd, "\x1b[A", 3); return;  /* up */
+    case 0x50: write(mfd, "\x1b[B", 3); return;  /* down */
+    case 0x4B: write(mfd, "\x1b[D", 3); return;  /* left */
+    case 0x4D: write(mfd, "\x1b[C", 3); return;  /* right */
+    case 0x0E: write(mfd, "\x7f", 1);   return;  /* backspace */
+    case 0x1C: write(mfd, "\r", 1);     return;  /* enter */
+    case 0x39: write(mfd, " ", 1);      return;  /* space */
+    case 0x49: if (sb_off < sb_count) sb_off += 10; return;
+    case 0x51: sb_off -= 10; if (sb_off < 0) sb_off = 0; return;
+    default: break;
+    }
+    if (ch >= 32 && ch < 127) { seq[0]=ch; write(mfd, seq, 1); }
+}
+
 int main(int argc, char* argv[]) {
-    (void)argc; (void)argv;
+    (void)argc;(void)argv;
     win_id = eigen_win_create(80, 60, WIN_W, WIN_H, "Terminal");
     if (win_id < 0) return 1;
     win_fb = (uint32_t*)eigen_win_map(win_id);
     eigen_win_getsize(win_id, &cur_w, &cur_h);
 
-    update_prompt();
-    buf_push("EigenOS Terminal  --  type 'help' for commands", C_ACC);
-    buf_push("", C_OUT);
+    for (int r=0;r<ROWS;r++) for (int c=0;c<COLS;c++){
+        grid[r][c].ch=' ';grid[r][c].fg=FG_DEF;grid[r][c].bg=BG_DEF;}
 
-    eigen_ev_t evs[MAX_EVS];
+    spawn_shell();
+
+    char rbuf[256];
+    eigen_ev_t evs[8];
     int running = 1;
     while (running) {
-        int n = eigen_win_poll(win_id, evs, MAX_EVS);
+        int n = eigen_win_poll(win_id, evs, 8);
         win_fb = (uint32_t*)eigen_win_map(win_id);
         eigen_win_getsize(win_id, &cur_w, &cur_h);
 
         for (int i = 0; i < n; i++) {
-            eigen_ev_t* ev = &evs[i];
-            if (ev->type == EIGEN_EV_CLOSE) { running = 0; break; }
-            if (ev->type == EIGEN_EV_KEY) {
-                if (ev->a >= 0x100 || (ev->a & 0x100)) continue;
-                int code = ev->b;
-                char ch = (char)ev->a;
-
-                if (code == 0x0E) {                    /* Backspace */
-                    if (input_len > 0) input[--input_len] = 0;
-                } else if (ch == '\n' || ch == '\r' || code == 0x1C) {
-                    input[input_len] = 0;
-                    cmd_exec(input);
-                    input_len = 0; input[0] = 0;
-                } else if (code == 0x48) {             /* Up: history */
-                    if (hist_count > 0) {
-                        if (hist_nav < hist_count - 1) hist_nav++;
-                        strncpy(input, history[hist_count - 1 - hist_nav], 255);
-                        input_len = (int)strlen(input);
-                    }
-                } else if (code == 0x50) {             /* Down: history */
-                    if (hist_nav > 0) {
-                        hist_nav--;
-                        strncpy(input, history[hist_count - 1 - hist_nav], 255);
-                        input_len = (int)strlen(input);
-                    } else {
-                        hist_nav = -1; input[0] = 0; input_len = 0;
-                    }
-                } else if (code == 0x49) {             /* PageUp: scroll back */
-                    scroll_off += 6;
-                    if (scroll_off > buf_count) scroll_off = buf_count;
-                } else if (code == 0x51) {             /* PageDown: scroll fwd */
-                    scroll_off -= 6;
-                    if (scroll_off < 0) scroll_off = 0;
-                } else if (ch == 27) {                 /* Esc: clear the line */
-                    input[0] = 0; input_len = 0;
-                } else if (ch >= 32 && ch < 127 && input_len < 255) {
-                    input[input_len++] = ch;
-                    input[input_len] = 0;
-                }
-            }
+            if (evs[i].type == EIGEN_EV_CLOSE) running = 0;
+            else if (evs[i].type == EIGEN_EV_KEY) send_key(&evs[i]);
         }
-        render_all();
-        eigen_sleep_ms(30);
+
+        if (mfd >= 0) {
+            int got = read(mfd, rbuf, sizeof(rbuf));
+            if (got > 0) vt_feed(rbuf, got);
+        }
+
+        render_screen();
+        eigen_sleep_ms(20);
     }
+    if (sh_pid > 0) eigen_kill(sh_pid, SIGKILL);
+    if (mfd >= 0) close(mfd);
     eigen_win_close(win_id);
     return 0;
 }

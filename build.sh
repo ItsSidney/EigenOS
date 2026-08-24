@@ -17,7 +17,7 @@ LD="ld"
 # GCC's own built-in include dir (stdint.h, stddef.h, stdarg.h, etc.)
 GCC_INC="$(gcc -print-file-name=include)"
 
-CFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC          -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone          -mcmodel=kernel -Iinclude -Iinclude/libs/tinygl -Isrc -Isrc/libs/bearssl/inc -Ilibs/wolfssl -DWOLFSSL_USER_SETTINGS -c"
+CFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC          -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone          -mcmodel=kernel -Iinclude -Iinclude/libs/tinygl -Isrc -Isrc/libs/bearssl/inc -Ilibs/wolfssl -DWOLFSSL_USER_SETTINGS -Isrc/user/lib/png -Isrc/user/lib/zlib -c"
 ASFLAGS="-f elf64"
 LDFLAGS="-Map=bin/kernel.map -T config/linker.ld -static -nostdlib -no-pie -z max-page-size=0x1000 -m elf_x86_64"
 
@@ -45,9 +45,9 @@ function check_tools() {
 
 function build_c() {
     echo "[BUILD] Compiling C source files..."
-    # src/user/ is RING-3 code — built by build_userland() / build_eina() etc.
+    # src/user/ is RING-3 code — built by build_userland() et al.
     # edim is excluded: the old ring-0 text editor is dead code.
-    C_SOURCES=$(find src -name "*.c" -not -path "*/user/*" -not -path "*/apps/system/edim.c" -not -path "*/libs/bearssl/*")
+    C_SOURCES=$(find src -name "*.c" -not -path "*/user/*" -not -path "*/apps/system/edim.c" -not -path "*/libs/bearssl/*" -not -path "*/kzcalloc.c")
     for src in $C_SOURCES; do
         rel_path=${src#src/}
         obj="$OBJ_DIR/${rel_path%.c}.o"
@@ -56,12 +56,38 @@ function build_c() {
         echo "  CC $src -> $obj"
         if [[ "$src" == *"net"* ]]; then
             $CC $CFLAGS -O2 -mno-sse -mno-sse2 $src -o $obj
+        elif [[ "$src" == *"ftfont.c" || "$src" == *"ftsystem_kernel.c" ]]; then
+            # Kernel FreeType text engine: needs the vendored FreeType headers.
+            $CC $CFLAGS -O2 -mno-sse -mno-sse2 -DFT2_BUILD_LIBRARY -Isrc/user/lib/freetype/include $src -o $obj
         elif [[ "$src" == *"ring3_test"* ]]; then
             $CC $CFLAGS -O0 $src -o $obj
         else
             $CC $CFLAGS -O2 $src -o $obj
         fi
     done
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FreeType (kernel side) — the SAME vendored sources the ring-3 port uses,
+# compiled into ring-0 objects so gui/ftfont.c can rasterize DejaVuSans for
+# the shell taskbar. ftsystem.c is REPLACED by src/kernel/lib/ftsystem_kernel.c
+# (kmalloc-backed memory manager, no file streams). Objects land OUTSIDE
+# bin/obj/user/ so the kernel link picks them up.
+# ──────────────────────────────────────────────────────────────────────────────
+function build_ftkernel() {
+    echo "[BUILD] Building FreeType (kernel text engine)..."
+    local FT_SRCS="base/ftinit.c base/ftdebug.c base/ftbase.c base/ftbbox.c base/ftglyph.c base/ftbdf.c base/ftbitmap.c base/ftmm.c cache/ftcache.c truetype/truetype.c sfnt/sfnt.c smooth/smooth.c raster/raster.c psnames/psnames.c psaux/psaux.c pshinter/pshinter.c"
+    mkdir -p "$OBJ_DIR/libs/freetype"
+    local src base obj
+    for f in $FT_SRCS; do
+        src="src/user/lib/freetype/src/$f"
+        [ -f "$src" ] || { echo "  [FTKERNEL] missing $src"; return 1; }
+        base=$(basename "$f" .c)
+        obj="$OBJ_DIR/libs/freetype/kft_$base.o"
+        echo "  CC freetype(kernel)/$f"
+        $CC $CFLAGS -O2 -mno-sse -mno-sse2 -DFT2_BUILD_LIBRARY -Isrc/user/lib/freetype/include "$src" -o "$obj" || { echo "[FTKERNEL] build failed on $src"; return 1; }
+    done
+    echo "[SUCCESS] FreeType kernel objects built"
 }
 
 function build_asm() {
@@ -92,6 +118,43 @@ function build_assets() {
         echo "  CP $bmp -> $ISO_ROOT/vendors/$(basename "$bmp")"
         cp "$bmp" "$ISO_ROOT/vendors/"
     done
+
+    # Auto-register EVERY wallpaper as a Limine module in BOTH boot entries:
+    # a new module line is inserted after each existing wallpapers/wp1 line,
+    # so dropping wpw1.bmp (or anything else) into src/assets/wallpapers/
+    # is enough for the kernel to see it as a boot module.
+    for bmp in src/assets/wallpapers/*.bmp; do
+        [ -f "$bmp" ] || continue
+        local wname=$(basename "$bmp"); wname="${wname%.*}"
+        if ! grep -qF "boot():/wallpapers/$wname.bmp" config/limine.conf; then
+            echo "  [WALLPAPER] registering boot module: $wname.bmp"
+            awk -v ins="    module_path: boot():/wallpapers/$wname.bmp" '
+                { print }
+                /module_path: boot\(\):\/wallpapers\/wp1\.bmp/ { print ins }
+            ' config/limine.conf > config/limine.conf.tmp && mv config/limine.conf.tmp config/limine.conf
+        fi
+    done
+
+    # Same guarantee for the kernel font: EVERY boot entry needs the
+    # DejaVuSans module or the shell silently falls back to the 8x16 font.
+    # Per-entry check (entries start with '/' at column 0); if an entry has
+    # no font line, one is inserted right after that entry's wp5 wallpaper.
+    awk -v ins="    module_path: boot():/fonts/DejaVuSans.ttf" '
+        { L[NR]=$0 }
+        /^[^ ].*EigenOS/ { if (anchor && !seenfont) mark[anchor]=1; anchor=0; seenfont=0 }
+        /module_path: boot\(\):\/wallpapers\/wp5\.bmp/ { anchor=NR }
+        /module_path: boot\(\):\/fonts\/DejaVuSans\.ttf/ { seenfont=1 }
+        END {
+            if (anchor && !seenfont) mark[anchor]=1
+            for (i=1; i<=NR; i++) { print L[i]; if (mark[i]) print ins }
+        }
+    ' config/limine.conf > config/limine.conf.tmp
+    if ! cmp -s config/limine.conf config/limine.conf.tmp; then
+        echo "  [WALLPAPER] registering boot module: fonts/DejaVuSans.ttf (missing from some boot entries)"
+        mv config/limine.conf.tmp config/limine.conf
+    else
+        rm -f config/limine.conf.tmp
+    fi
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -162,7 +225,12 @@ function build_kernel() {
 
     # WolfSSL objects are vendored under libs/ (outside src/), so they must
     # be built AFTER the prune pass above (prune would delete them otherwise).
+    # Same for the kernel-side FreeType objects — and the zlib/libpng pair
+    # that powers the Nordzy icon theme decoder.
     build_wolfssl
+    build_ftkernel
+    build_zlibk
+    build_pngk
 
     echo "[BUILD] Linking kernel..."
     mkdir -p "$(dirname "$KERNEL_BIN")"
@@ -182,15 +250,43 @@ function build_kernel() {
 #   userui     — ring-3 UI toolkit
 
 USER_NOSTDINC="-nostdinc -I$GCC_INC"
-UCFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone -mcmodel=kernel $USER_NOSTDINC -Isrc/user/lib/libc/inc -Iinclude -Iinclude/user -Isrc/user/lib/userlib -Isrc/user/lib/userui -Isrc/user/lib/tinygl -Isrc/user/lib -c"
-ULDFLAGS="-nostdlib -no-pie -m elf_x86_64"
+UCFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone -mcmodel=kernel $USER_NOSTDINC -Isrc/user/lib/libc/inc -Iinclude -Iinclude/user -Isrc/user/lib/userlib -Isrc/user/lib/userui -Isrc/user/lib/tinygl -Isrc/user/lib/freetype/include -Isrc/user/lib -Isrc/user/lib/eigenui -c"
+ULDFLAGS="-nostdlib -no-pie -m elf_x86_64 -z muldefs"
 UCC="$CC"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Register a boot module in EVERY Limine boot entry (entries are delimited by
+# '/'-prefixed headers; each anchors on its fonts/DejaVuSans.ttf module line,
+# guaranteed present by build_assets' font fixer). Existing copies of the
+# exact line are deduped first, so re-running stays idempotent and modules
+# appended at EOF by older builds get normalized into both entries.
+# ──────────────────────────────────────────────────────────────────────────────
+function register_boot_module() {
+    local path="$1"                     # e.g. boot():/user/doom.elf
+    [ -z "$path" ] && return 0
+    local line="    module_path: $path"
+    grep -vF "$line" config/limine.conf > config/limine.conf.tmp
+    awk -v ins="$line" '
+        { print }
+        index($0, "module_path: boot():/fonts/DejaVuSans.ttf") > 0 { print ins }
+    ' config/limine.conf.tmp > config/limine.conf && rm -f config/limine.conf.tmp
+}
+
 function build_userland() {
+    # Real musl (process/linux/sched included) — must precede all apps.
+    if [ ! -f bin/obj/user/libmusl.a ]; then
+        echo "[BUILD] Building musl (libc archive)..."
+        bash tools/build-musl.sh || { echo "[MUSL] build failed"; return 1; }
+        mkdir -p bin/libs && cp -f bin/obj/user/libmusl.a bin/libs/libmusl.a
+    elif [ -f bin/libs/libmusl.a ] && [ bin/libs/libmusl.a -nt tools/build-musl.sh ]; then
+        cp -f bin/libs/libmusl.a bin/obj/user/libmusl.a
+    fi
+
     echo "[BUILD] Building userland apps..."
     mkdir -p bin/userapp $ISO_ROOT/user bin/obj/user/lib
 
     # Shared ring-3 runtime compiled ONCE and linked into every app ELF.
+    mkdir -p bin/obj/user/lib bin/userapp
     for lib in userlib/userlib userui/userui userui/vector_icons userui/file_dialog                 libc/libc libc/posix libc/math libc/setjmp pthread/pthread; do
         if [ -f "src/user/lib/$lib.c" ]; then
 
@@ -208,9 +304,18 @@ function build_userland() {
         fi
     done
 
+    # EigenUI (modern GUI toolkit — layered EFL/Elementary-style)
+    for f in src/user/lib/eigenui/*.c; do
+        if [ -f "$f" ]; then
+            base=$(basename "$f" .c)
+            echo "  CC lib/eigenui/$base.c -> bin/obj/user/lib/eui_$base.o"
+            $UCC $UCFLAGS "$f" -o "bin/obj/user/lib/eui_$base.o"
+        fi
+    done
+
 
     # FreeType
-    local FT_SRCS="base/ftsystem.c base/ftinit.c base/ftdebug.c base/ftbase.c base/ftbbox.c base/ftglyph.c base/ftbdf.c base/ftbitmap.c base/ftmm.c truetype/truetype.c sfnt/sfnt.c smooth/smooth.c raster/raster.c psnames/psnames.c psaux/psaux.c pshinter/pshinter.c"
+    local FT_SRCS="base/ftsystem.c base/ftinit.c base/ftdebug.c base/ftbase.c base/ftbbox.c base/ftglyph.c base/ftbdf.c base/ftbitmap.c base/ftmm.c cache/ftcache.c truetype/truetype.c sfnt/sfnt.c smooth/smooth.c raster/raster.c psnames/psnames.c psaux/psaux.c pshinter/pshinter.c"
     for f in $FT_SRCS; do
         if [ -f "src/user/lib/freetype/src/$f" ]; then
             local base=$(basename "$f" .c)
@@ -228,26 +333,40 @@ function build_userland() {
         fi
     done
 
+    # Lua 5.1.5: restore archive or build it fresh. Must happen BEFORE apps.
+    if [ -f bin/libs/liblua.a ]; then
+        cp bin/libs/liblua.a bin/obj/user/liblua.a
+    elif [ -d libs/lua ] && [ ! -f bin/obj/user/liblua.a ]; then
+        bash tools/build-lua.sh > /dev/null 2>&1 || true
+        ar rcs bin/obj/user/liblua.a bin/obj/user/lua/*.o 2>/dev/null || true
+        mkdir -p bin/libs && cp -f bin/obj/user/liblua.a bin/libs/liblua.a
+        echo "[BUILD] Lua archived: $(ls -la bin/obj/user/liblua.a 2>/dev/null | awk '{print $5}') bytes"
+    fi
+    [ -f bin/obj/user/liblua.a ] || ar rcs bin/obj/user/liblua.a
+
     # Single-file apps under src/user/apps/
     while IFS= read -r src; do
         [ -f "$src" ] || continue
         base=$(basename "$src" .c)
         echo "  CC user/$base.c -> bin/userapp/$base.o"
         local app_cflags="$UCFLAGS"
-        # EFL-using apps need the Eina/Eo header directories on the include path.
+        # Apps that need extra include paths (non-EFL codecs / VM).
         case "$base" in
-            eintest) app_cflags="$app_cflags -Isrc/user/lib/eina" ;;
-            eotest)  app_cflags="$app_cflags -Isrc/user/lib/eina -Isrc/user/lib/eo -DEAPI= -DEAPI_WEAK= -DEOAPI=" ;;
             zlibtest) app_cflags="$app_cflags -Isrc/user/lib/zlib" ;;
-            eettest) app_cflags="$app_cflags -Isrc/user/lib/eina -Isrc/user/lib/emile -Isrc/user/lib/eet -Isrc/user/lib/zlib" ;;
             pngtest) app_cflags="$app_cflags -Isrc/user/lib/png -Isrc/user/lib/zlib" ;;
             jpegtest) app_cflags="$app_cflags -Isrc/user/lib/jpeg" ;;
-            ecoretest) app_cflags="$app_cflags -Isrc/user/lib/ecore" ;;
+            luatest) app_cflags="$UCFLAGS -Ilibs/lua/src" ;;
         esac
         $UCC $app_cflags "$src" -o "bin/userapp/$base.o"
 
         echo "  LD user/$base.elf"
-        $LD $ULDFLAGS -o "bin/userapp/$base.elf" "bin/userapp/$base.o"              bin/obj/user/lib/*.o bin/obj/user/libeina.a bin/obj/user/libeo.a bin/obj/user/libeet.a bin/obj/user/libemile.a bin/obj/user/libpng.a bin/obj/user/libjpeg.a bin/obj/user/libecore.a bin/obj/user/libezlib.a
+        if [ "$base" = "luatest" ]; then
+          $LD $ULDFLAGS -o "bin/userapp/$base.elf" "bin/userapp/$base.o" \
+            bin/obj/user/lib/*.o bin/obj/user/liblua.a
+        else
+          $LD $ULDFLAGS -o "bin/userapp/$base.elf" "bin/userapp/$base.o" \
+            bin/obj/user/lib/*.o bin/obj/user/libmusl.a bin/obj/user/libpng.a bin/obj/user/libjpeg.a bin/obj/user/libezlib.a
+        fi
 
         echo "  CP user/$base.elf -> $ISO_ROOT/user/"
         cp "bin/userapp/$base.elf" "$ISO_ROOT/user/"
@@ -257,85 +376,35 @@ function build_userland() {
     build_folders
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Eina (EFL core library) — freestanding port
-# ──────────────────────────────────────────────────────────────────────────────
-function build_eina() {
-    echo "[BUILD] Building Eina (EFL core, ring-3 port)..."
-    mkdir -p bin/obj/user/eina
-
-    # Eina-specific flags layered on top of the common user flags.
-    # -nostdinc is inherited from UCFLAGS; eina's own dir is added last so
-    # its internal headers take priority over any same-named file elsewhere.
-    local EINA_DIR="src/user/lib/eina"
-    local EINA_CFLAGS="$UCFLAGS -I$EINA_DIR -DEINA_BUILD -DEFL_BUILD -DEFL_BETA_API_SUPPORT -DHAVE_CLOCK_GETTIME -UHAVE_MMAP -UHAVE_EXECINFO_H -UHAVE_VALGRIND -DNVALGRIND -w"
-    # NOTE: -UHAVE_MMAP and -UHAVE_EXECINFO_H suppress mmap/libunwind paths
-    # which are OS-specific and we do not need for the freestanding port.
-
-    # Files that use POSIX-only APIs we cannot stub:
-    #   eina_file_posix.c  — mmap-based file loader (replaced by our VFS)
-    #   eina_file_win32.c  — Windows only
-    #   eina_thread_win32.c — Windows only
-    #   eina_win32_dllmain.c — Windows only
-    #   eina_debug_bt*.c   — libunwind / backtrace (not available ring-3)
-    #   eina_debug_cpu.c   — CPU profiling (POSIX signals)
-    #   eina_debug_thread.c— pthread internals we stub
-    #   eina_mmap.c        — mmap wrapper
-    #   eina_xattr.c       — Linux extended attributes (xattr syscall)
-    local EXCLUDE="eina_file_posix.c eina_file_win32.c eina_thread_win32.c \\
-                   eina_win32_dllmain.c eina_debug.c eina_debug_bt.c eina_debug_bt_file.c \\
-                   eina_debug_cpu.c eina_debug_thread.c eina_mmap.c eina_xattr.c \\
-                   eina_module.c eina_evlog.c eina_benchmark.c eina_hamster.c"
-
-    local EINA_OBJS=""
-    while IFS= read -r src; do
-        [ -f "$src" ] || continue
-        local b=$(basename "$src")
-        local skip=0
-        for e in $EXCLUDE; do [ "$b" = "$e" ] && skip=1 && break; done
-        [ $skip -eq 1 ] && echo "  [SKIP] eina/$b (excluded)" && continue
-
-        local obj="bin/obj/user/eina/${b%.c}.o"
-        echo "  CC eina/$b"
-        $UCC $EINA_CFLAGS "$src" -o "$obj" || { echo "[EINA] build failed on $b"; return 1; }
-        EINA_OBJS="$EINA_OBJS $obj"
-    done < <(find "$EINA_DIR" -maxdepth 1 -name '*.c' | sort)
-
-    # Archive Eina into a static lib so it links cleanly into any EFL app.
-    echo "  AR bin/obj/user/libeina.a"
-    ar rcs bin/obj/user/libeina.a $EINA_OBJS
-    echo "[SUCCESS] Eina library built: bin/obj/user/libeina.a"
+function build_zlibk() {
+    echo "[BUILD] Building zlib (kernel icon-decoder support)..."
+    mkdir -p "$OBJ_DIR/libs/zlib"
+    local ZSRCS="adler32.c crc32.c inflate.c inffast.c inftrees.c zutil.c compress.c uncompr.c infback.c deflate.c trees.c"
+    local s base obj
+    for s in $ZSRCS; do
+        src="src/user/lib/zlib/$s"; base=$(basename "$s" .c)
+        obj="$OBJ_DIR/libs/zlib/kz_$base.o"
+        echo "  CC zlib-kernel/$s"
+        $CC $CFLAGS -DZ_SOLO -DMY_ZCALLOC -w "$src" -o "$obj" || { echo "[ZLIB-K] failed on $s"; return 1; }
+    done
+    src="src/libs/kzcalloc.c"
+    echo "  CC libs/kzcalloc.c"
+    $CC $CFLAGS -DZ_SOLO -DMY_ZCALLOC -w "$src" -o "$OBJ_DIR/libs/zlib/kz_kzcalloc.o" || return 1
+    echo "[SUCCESS] kernel zlib built"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Eo (EFL object system, ring-3 port) — depends on Eina.
-# Generated .eo.h/.eo.c come from host eolian_gen (see notes in eo/ dir).
-# ──────────────────────────────────────────────────────────────────────────────
-function build_eo() {
-    echo "[BUILD] Building Eo (EFL object system, ring-3 port)..."
-    mkdir -p bin/obj/user/eo
-
-    local EO_DIR="src/user/lib/eo"
-    local EINA_DIR="src/user/lib/eina"
-    local EO_CFLAGS="$UCFLAGS -I$EO_DIR -I$EINA_DIR -DEINA_BUILD -DEFL_BUILD -DEFL_BETA_API_SUPPORT -DEAPI= -DEAPI_WEAK= -DEOAPI= -DHAVE_CLOCK_GETTIME -UHAVE_MMAP -UHAVE_EXECINFO_H -UHAVE_VALGRIND -DNVALGRIND -w"
-
-    local EO_OBJS=""
-    while IFS= read -r src; do
-        [ -f "$src" ] || continue
-        local b=$(basename "$src")
-        # Generated .eo.c files are #include'd by their hand-written .c
-        # counterparts (eo_base_class.c, eo.c, eo_class_class.c) — they must
-        # not be compiled as standalone translation units.
-        case "$b" in *.eo.c) continue ;; esac
-        local obj="bin/obj/user/eo/${b%.c}.o"
-        echo "  CC eo/$b"
-        $UCC $EO_CFLAGS "$src" -o "$obj" || { echo "[EO] build failed on $b"; return 1; }
-        EO_OBJS="$EO_OBJS $obj"
-    done < <(find "$EO_DIR" -maxdepth 1 -name '*.c' | sort)
-
-    echo "  AR bin/obj/user/libeo.a"
-    ar rcs bin/obj/user/libeo.a $EO_OBJS
-    echo "[SUCCESS] Eo library built: bin/obj/user/libeo.a"
+function build_pngk() {
+    echo "[BUILD] Building libpng (kernel icon-decoder support)..."
+    mkdir -p "$OBJ_DIR/libs/png"
+    local PSRCS="png.c pngerror.c pngget.c pngmem.c pngpread.c pngread.c pngrio.c pngrtran.c pngrutil.c pngset.c pngtrans.c pngwrite.c pngwio.c pngwtran.c pngwutil.c"
+    local s base obj
+    for s in $PSRCS; do
+        src="src/user/lib/png/$s"; base=$(basename "$s" .c)
+        obj="$OBJ_DIR/libs/png/kp_$base.o"
+        echo "  CC png-kernel/$s"
+        $CC $CFLAGS -DPNG_NO_STDIO -include src/libs/kmath.h -w "$src" -o "$obj" || { echo "[PNG-K] failed on $s"; return 1; }
+    done
+    echo "[SUCCESS] kernel libpng built"
 }
 
 function build_zlib() {
@@ -358,59 +427,6 @@ function build_zlib() {
     echo "  AR bin/obj/user/libezlib.a"
     ar rcs bin/obj/user/libezlib.a $ZLIB_OBJS
     echo "[SUCCESS] zlib library built: bin/obj/user/libezlib.a"
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Emile (EFL serialization / compression, ring-3 port) — depends on Eina + zlib.
-# Cipher backends (OpenSSL/GnuTLS) are stubbed (see emile_cipher_stub.c).
-# ──────────────────────────────────────────────────────────────────────────────
-function build_emile() {
-    echo "[BUILD] Building Emile (EFL serialization/compression, ring-3 port)..."
-    mkdir -p bin/obj/user/emile
-
-    local EMILE_DIR="src/user/lib/emile"
-    local EMILE_CFLAGS="$UCFLAGS -I$EMILE_DIR -Isrc/user/lib/eina -Isrc/user/lib/zlib -DEFL_BUILD -DEFL_BETA_API_SUPPORT -w"
-
-    local EMILE_OBJS=""
-    while IFS= read -r src; do
-        [ -f "$src" ] || continue
-        local b=$(basename "$src")
-        local obj="bin/obj/user/emile/${b%.c}.o"
-        echo "  CC emile/$b"
-        $UCC $EMILE_CFLAGS "$src" -o "$obj" || { echo "[EMILE] build failed on $b"; return 1; }
-        EMILE_OBJS="$EMILE_OBJS $obj"
-    done < <(find "$EMILE_DIR" -maxdepth 1 -name '*.c' | sort)
-
-    echo "  AR bin/obj/user/libemile.a"
-    ar rcs bin/obj/user/libemile.a $EMILE_OBJS
-    echo "[SUCCESS] Emile library built: bin/obj/user/libemile.a"
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Eet (EFL serialization library, ring-3 port) — depends on Eina + Emile + zlib.
-# The container I/O layer is a fresh eet_lib.c (see that file); the serialization
-# core (eet_data.c, eet_dictionary.c, eet_node.c, eet_alloc.c) is upstream.
-# ──────────────────────────────────────────────────────────────────────────────
-function build_eet() {
-    echo "[BUILD] Building Eet (EFL serialization, ring-3 port)..."
-    mkdir -p bin/obj/user/eet
-
-    local EET_DIR="src/user/lib/eet"
-    local EET_CFLAGS="$UCFLAGS -I$EET_DIR -Isrc/user/lib/eina -Isrc/user/lib/emile -Isrc/user/lib/zlib -DEFL_BUILD -DEFL_BETA_API_SUPPORT -w"
-
-    local EET_OBJS=""
-    while IFS= read -r src; do
-        [ -f "$src" ] || continue
-        local b=$(basename "$src")
-        local obj="bin/obj/user/eet/${b%.c}.o"
-        echo "  CC eet/$b"
-        $UCC $EET_CFLAGS "$src" -o "$obj" || { echo "[EET] build failed on $b"; return 1; }
-        EET_OBJS="$EET_OBJS $obj"
-    done < <(find "$EET_DIR" -maxdepth 1 -name '*.c' | sort)
-
-    echo "  AR bin/obj/user/libeet.a"
-    ar rcs bin/obj/user/libeet.a $EET_OBJS
-    echo "[SUCCESS] Eet library built: bin/obj/user/libeet.a"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -470,34 +486,6 @@ function build_jpeg() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Ecore (EFL main-loop, ring-3 port) — classic scheduling API without the
-# Efl interface layer (eolian codegen unavailable in this freestanding port).
-# ──────────────────────────────────────────────────────────────────────────────
-function build_ecore() {
-    echo "[BUILD] Building Ecore (main-loop, freestanding port)..."
-    mkdir -p bin/obj/user/ecore
-
-    local ECORE_DIR="src/user/lib/ecore"
-    local ECORE_CFLAGS="$UCFLAGS -I$ECORE_DIR -w"
-
-    local ECORE_OBJS=""
-    while IFS= read -r src; do
-        [ -f "$src" ] || continue
-        local b=$(basename "$src")
-        local obj="bin/obj/user/ecore/${b%.c}.o"
-        echo "  CC ecore/$b"
-        $UCC $ECORE_CFLAGS "$src" -o "$obj" || { echo "[ECORE] build failed on $b"; return 1; }
-        ECORE_OBJS="$ECORE_OBJS $obj"
-    done < <(find "$ECORE_DIR" -maxdepth 1 -name '*.c' | sort)
-
-    echo "  AR bin/obj/user/libecore.a"
-    ar rcs bin/obj/user/libecore.a $ECORE_OBJS
-    echo "[SUCCESS] Ecore built: bin/obj/user/libecore.a"
-}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Read a KEY=VALUE pair out of a build.conf; echoes the value (or "").
-# ──────────────────────────────────────────────────────────────────────────────
 function conf_get() {
     local file="$1" key="$2"
     [ -f "$file" ] || { echo ""; return; }
@@ -549,15 +537,13 @@ function build_folders() {
         [ -z "$OBJS" ] && continue
 
         echo "  LD user/$NAME.elf"
-        $LD $ULDFLAGS -o "bin/userapp/$NAME.elf" $OBJS              bin/obj/user/lib/*.o              bin/obj/user/libpng.a bin/obj/user/libjpeg.a bin/obj/user/libecore.a bin/obj/user/libezlib.a              || { echo "[FOLDER] link failed for $NAME"; return 1; }
+        $LD $ULDFLAGS -o "bin/userapp/$NAME.elf" $OBJS              bin/obj/user/lib/*.o              bin/obj/user/libpng.a bin/obj/user/libjpeg.a bin/obj/user/libezlib.a              || { echo "[FOLDER] link failed for $NAME"; return 1; }
 
         echo "  CP user/$NAME.elf -> $ISO_ROOT/user/"
         cp "bin/userapp/$NAME.elf" "$ISO_ROOT/user/"
 
-        # Register as a Limine module so it can be spawned (idempotent).
-        if ! grep -qF "boot():/user/$NAME.elf" config/limine.conf; then
-            printf '    module_path: boot():/user/%s.elf\n' "$NAME"                  >> config/limine.conf
-        fi
+        # Register as a Limine module in EVERY boot entry (idempotent).
+        register_boot_module "boot():/user/$NAME.elf"
     done < <(find src/user/apps -mindepth 3 -maxdepth 3 -name build.conf | sort)
 }
 
@@ -625,6 +611,7 @@ function build_awk() {
     echo "[SUCCESS] awk ELF built."
 }
 
+
 function build_iso() {
     echo "[BUILD] Creating ISO image..."
     mkdir -p $ISO_ROOT/boot
@@ -667,14 +654,9 @@ function build() {
     check_tools
     echo "[BUILD] Starting Eigen build process..."
     build_kernel
-    build_eina
-    build_eo
     build_zlib
-    build_emile
-    build_eet
     build_png
     build_jpeg
-    build_ecore
     build_userland
     build_doom
     build_awk
@@ -697,7 +679,7 @@ function run() {
         exit 1
     fi
 
-    QEMU_FLAGS="-cdrom $ISO_NAME -m 4G -smp 4 -machine q35 -serial stdio                  -net nic,model=e1000 -net user -rtc base=localtime                  -vga std -display vnc=:1                  -device AC97"
+    QEMU_FLAGS="-cdrom $ISO_NAME -m 4G -smp 4 -machine q35 -serial stdio                  -net nic,model=e1000 -net user -rtc base=localtime                  -vga std -display vnc=:1                  -device AC97 -drive file=eigen_disk.img,format=raw,if=virtio"
 
     if [ -e /dev/kvm ]; then
         QEMU_FLAGS="$QEMU_FLAGS -cpu host -enable-kvm"
@@ -752,33 +734,9 @@ case "$1" in
     "run"|"-r"|"--run")
         run
         ;;
-    "eina")
-        # Build only the Eina library — useful during the EFL port.
-        # Requires userland libs to already be compiled.
-        build_eina
-        ;;
-    "eo")
-        # Build only the Eo library — useful during the EFL port.
-        # Requires userland libs (and Eina) to already be compiled.
-        build_eo
-        ;;
     "zlib")
-        # Build only the zlib library — useful during the EFL port (Eet needs it).
-        # Requires userland libs to already be compiled.
+        # Build only the zlib library.
         build_zlib
-        ;;
-    "emile")
-        # Build only the Emile library — useful during the EFL port.
-        build_eina
-        build_zlib
-        build_emile
-        ;;
-    "eet")
-        # Build only the Eet library — useful during the EFL port.
-        build_eina
-        build_zlib
-        build_emile
-        build_eet
         ;;
     "png")
         # Build only the libpng library — useful during the libpng port.
@@ -789,9 +747,14 @@ case "$1" in
         # Build only the libjpeg library — useful during the libjpeg port.
         build_jpeg
         ;;
-    "ecore")
-        # Build only the Ecore library — useful during the EFL UI stack port.
-        build_ecore
+    "lua")
+        # Build vendored Lua 5.1.5 (ring-3 lib) + freestanding shims.
+        bash tools/build-lua.sh
+        mkdir -p bin/obj/user bin/libs
+        AR_OBJS="$(ls bin/obj/user/lua/*.o 2>/dev/null)"
+        ar rcs bin/obj/user/liblua.a $AR_OBJS 2>/dev/null || true
+        cp -f bin/obj/user/liblua.a bin/libs/liblua.a
+        echo "[SUCCESS] Lua 5.1.5 archived"
         ;;
     "log")
         if [ ! -f $ISO_NAME ]; then build; fi
@@ -808,11 +771,14 @@ case "$1" in
         echo "[RUN] Log saved to eigen_qemu.log (lines: $(wc -l < eigen_qemu.log))"
         ;;
     "help"|*)
-        echo "Usage: $0 {build|clean|run|eina|log|help}"
+        echo "Usage: $0 {build|clean|run|zlib|png|jpeg|lua|log|help}"
         echo "  build: Compiles kernel + all ring-3 apps + ISO"
         echo "  clean: Removes build artifacts"
         echo "  run:   Builds (if needed) and runs in QEMU"
-        echo "  eina:  Compile only the Eina EFL library (for iteration)"
+        echo "  zlib:  Compile only the zlib library"
+        echo "  png:   Compile zlib + libpng"
+        echo "  jpeg:  Compile only libjpeg"
+        echo "  lua:   Build vendored Lua 5.1.5"
         echo "  log:   Run headless and save serial log to eigen_qemu.log"
         echo "  help:  Shows this help"
         ;;

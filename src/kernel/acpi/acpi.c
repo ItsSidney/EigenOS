@@ -57,24 +57,37 @@ static void* hhdm_ptr(uint64_t phys) {
     return (void*)(phys + hhdm_offset);
 }
 
+extern void serial_u64(uint64_t v);
+
+extern void serial_puts(const char*);
 struct acpi_rsdp* acpi_find_rsdp(void) {
     if (g_rsdp) return g_rsdp;
+    serial_puts("[RSDP] 1: checked cache\n");
 
-    if (!rsdp_request.response || !rsdp_request.response->address) {
-        klog("[ACPI] No RSDP from bootloader\n");
+    if (!rsdp_request.response) {
+        serial_puts("[RSDP] 2a: no response\n");
         return NULL;
     }
+    serial_puts("[RSDP] 2b: response ok\n");
+    if (!rsdp_request.response->address) {
+        serial_puts("[RSDP] 2c: no address\n");
+        return NULL;
+    }
+    serial_puts("[RSDP] 3: addr present\n");
 
     struct acpi_rsdp* rsdp = (struct acpi_rsdp*)hhdm_ptr((uint64_t)rsdp_request.response->address);
+    serial_puts("[RSDP] 4: hhdm converted\n");
     if (!rsdp) {
         klog("[ACPI] RSDP address invalid\n");
         return NULL;
     }
 
+    serial_puts("[RSDP] 5: pre-sig-check\n");
     if (rsdp->signature != ACPI_RSDP_SIG) {
-        klog("[ACPI] RSDP sig mismatch\n");
+        serial_puts("[RSDP] sig mismatch\n");
         return NULL;
     }
+    serial_puts("[RSDP] 6: sig ok\n");
 
     int checksum_ok = 0;
     if (rsdp->revision >= 2) {
@@ -313,6 +326,10 @@ uint32_t acpi_get_io_apic_addr(int index) {
 int acpi_pm_timer_available(void) { return g_pm_timer_avail; }
 
 void acpi_reboot(void) {
+    {
+        extern void persist_sync(const char*);
+        persist_sync("reboot");
+    }
     if (!acpi_find_fadt()) return;
 
     uint16_t reset_port = 0;
@@ -373,47 +390,57 @@ int acpi_get_battery_status(struct acpi_battery_status* status) {
 }
 
 int acpi_init(void) {
-    klog("[ACPI] Init start\n");
+    extern void serial_puts(const char*);
+    serial_puts("[ACPI] entering\n");
+    serial_puts("[ACPI] Init start\n");
 
     if (!acpi_find_rsdp()) {
         klog("[ACPI] No RSDP\n");
         return 0;
     }
 
-    klog("[ACPI] After RSDP\n");
+    serial_puts("[ACPI] After RSDP\n");
 
+    serial_puts("[ACPI] pre-fadt\n");
     acpi_parse_fadt();
+    serial_puts("[ACPI] post-fadt\n");
 
-    klog("[ACPI] After FADT\n");
+    serial_puts("[ACPI] After FADT\n");
 
+    serial_puts("[ACPI] pre-madt\n");
     g_madt = (struct acpi_madt*)acpi_find_table_by_sig(ACPI_APIC_SIG);
+    serial_puts("[ACPI] post-madt\n");
     if (g_madt) {
         g_apic_found = 1;
-        klog("[ACPI] MADT found, parsing...\n");
+        serial_puts("[ACPI] MADT found, parsing...\n");
         parse_madt();
-        klog("[ACPI] MADT done\n");
+        serial_puts("[ACPI] MADT done\n");
     } else {
-        klog("[ACPI] No APIC table\n");
+        serial_puts("[ACPI] No APIC table\n");
     }
 
+    serial_puts("[ACPI] pre-hpet\n");
     g_hpet = (struct acpi_hpet*)acpi_find_table_by_sig(ACPI_HPET_SIG);
+    serial_puts("[ACPI] post-hpet\n");
     if (g_hpet) {
         g_hpet_found = 1;
-        klog("[ACPI] HPET found\n");
+        serial_puts("[ACPI] HPET found\n");
     } else {
-        klog("[ACPI] No HPET table\n");
+        serial_puts("[ACPI] No HPET table\n");
     }
 
     g_mcfg = (struct acpi_mcfg*)acpi_find_table_by_sig(ACPI_MCFG_SIG);
     if (g_mcfg) {
         g_mcfg_found = 1;
-        klog("[ACPI] MCFG found\n");
+        serial_puts("[ACPI] MCFG found\n");
     } else {
-        klog("[ACPI] No MCFG table\n");
+        serial_puts("[ACPI] No MCFG table\n");
     }
 
+    serial_puts("[ACPI] pre-ssdt\n");
     acpi_parse_ssdts();
+    serial_puts("[ACPI] post-ssdt\n");
 
-    klog("[ACPI] Init done\n");
+    serial_puts("[ACPI] Init done\n");
     return 0;
 }

@@ -1454,10 +1454,20 @@ void draw_search_icon(int x, int y, int w, int h) {
 void draw_app_icon_tile(const char* name, int x, int y, int size, int state, uint32_t acc) {
     if (!name || name[0] == '-') return;
 
+    /* Nordzy themed icon first; procedural glyph is the fallback */
+    extern int icon_theme_draw(const char* app, int x, int y, int size);
+    if (icon_theme_draw(name, x, y, size)) {
+        if (state == 2) {
+            gfx_draw_rect_outline(x, y, size, size, 2, acc);
+        } else if (state == 1) {
+            gfx_fill_rect_alpha(x, y, size, size, 0xFFFFFF, 26);
+        }
+        return;
+    }
+
     if (state == 2) {
         gfx_fill_rect_rounded(x, y, size, size, 10, acc);
         gfx_fill_rect_alpha(x, y, size, size, acc, 50);
-        gfx_draw_rect_rounded_outline(x, y, size, size, 10, 1, gfx_lighten(acc, 40));
     } else if (state == 1) {
         gfx_fill_rect_rounded(x, y, size, size, 10, 0x202430);
         gfx_fill_rect_alpha(x, y, size, size, 0xFFFFFF, 30);

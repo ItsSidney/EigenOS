@@ -5,6 +5,7 @@
 #define EIGEN_SHIM_MATH_H
 
 #define M_PI  3.14159265358979323846
+#define M_PI_2 1.57079632679489661923
 #define M_E   2.71828182845904523536
 
 #define isnan(x)   ((x) != (x))
@@ -54,4 +55,16 @@ double round(double x);
 }
 #endif
 
+#endif
+/* freestanding fpclassify (used by upstream Evas/Ector code) */
+#ifndef EIGEN_FPCLASSIFY
+#define EIGEN_FPCLASSIFY
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, (x))
+#ifndef FP_NAN
+#define FP_NAN 0
+#define FP_INFINITE 1
+#define FP_NORMAL 2
+#define FP_SUBNORMAL 3
+#define FP_ZERO 4
+#endif
 #endif

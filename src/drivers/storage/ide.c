@@ -30,13 +30,14 @@ extern void draw_boot_log(void);
 #define IDE_CMD_IDENTIFY   0xEC
 
 extern void serial_puts(const char* s);
+extern void serial_u64(uint64_t v);
 
 static int ide_wait_busy(uint16_t base, uint32_t timeout) {
-    uint32_t check = 0;
     while (timeout--) {
         if (!(port_byte_in(base + IDE_REG_STATUS) & 0x80)) return 0;
-        if (++check % 256 == 0) draw_boot_log();
-        for(volatile int i=0; i<10; i++);
+        /* NOTE: no draw_boot_log() here — redrawing the whole boot screen
+         * inside a polling loop made every disk op crawl under KVM. */
+        for (volatile int i = 0; i < 10; i++);
     }
     return -1;
 }
@@ -47,7 +48,6 @@ static int ide_wait_ready(uint16_t base, uint32_t timeout) {
         uint8_t status = port_byte_in(base + IDE_REG_STATUS);
         if (status & 0x08) return 0;
         if (status & 0x01) return -1; // Error
-        if (++check % 256 == 0) draw_boot_log();
         for(volatile int i=0; i<10; i++);
     }
     return -1;
@@ -76,6 +76,28 @@ int ide_read_sectors(block_device_t* dev, uint64_t lba, uint32_t count, void* bu
     return 0;
 }
 
+int ide_write_sectors(block_device_t* dev, uint64_t lba, uint32_t count,
+                      const void* buf) {
+    uint16_t base = (uintptr_t)dev->priv;
+    const uint16_t* ptr = (const uint16_t*)buf;
+
+    if (ide_wait_busy(base, 1000) < 0) return -1;
+    port_byte_out(base + IDE_REG_DRIVE_SEL, 0xE0 | ((lba >> 24) & 0x0F));
+    port_byte_out(base + IDE_REG_SEC_COUNT, count);
+    port_byte_out(base + IDE_REG_LBA_LOW,  (uint8_t)lba);
+    port_byte_out(base + IDE_REG_LBA_MID,  (uint8_t)(lba >> 8));
+    port_byte_out(base + IDE_REG_LBA_HIGH, (uint8_t)(lba >> 16));
+    port_byte_out(base + IDE_REG_COMMAND, IDE_CMD_WRITE_PIO);
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (ide_wait_busy(base, 1000) < 0) return -1;
+        if (ide_wait_ready(base, 1000) < 0) return -1;
+        for (int j = 0; j < 256; j++)
+            port_word_out(base + IDE_REG_DATA, *ptr++);
+    }
+    return 0;
+}
+
 void ide_init() {
     serial_puts("[IDE] Initializing...\n");
     // Non-blocking presence check
@@ -99,11 +121,34 @@ void ide_init() {
         }
     }
 
+    // IDENTIFY DEVICE: read LBA capacity (words 60..61) for size_sectors
+    uint64_t cap_sectors = 0;
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_DRIVE_SEL, 0xA0);
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_SEC_COUNT, 0);
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_LBA_LOW,  0);
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_LBA_MID,  0);
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_LBA_HIGH, 0);
+    port_byte_out(IDE_PRIMARY_BASE + IDE_REG_COMMAND, IDE_CMD_IDENTIFY);
+    if (ide_wait_busy(IDE_PRIMARY_BASE, 1000) == 0 &&
+        !(port_byte_in(IDE_PRIMARY_BASE + IDE_REG_STATUS) & 0x01)) {
+        if (ide_wait_ready(IDE_PRIMARY_BASE, 1000) == 0) {
+            uint16_t idw[256];
+            for (int j = 0; j < 256; j++)
+                idw[j] = port_word_in(IDE_PRIMARY_BASE + IDE_REG_DATA);
+            cap_sectors = (uint64_t)idw[60] | ((uint64_t)idw[61] << 16);
+        }
+    }
+
     static block_device_t ide0;
     strcpy(ide0.name, "ide0");
     ide0.block_size = 512;
-    ide0.read = ide_read_sectors;
-    ide0.priv = (void*)IDE_PRIMARY_BASE;
+    ide0.size_sectors = cap_sectors;
+    ide0.read  = ide_read_sectors;
+    ide0.write = ide_write_sectors;
+    ide0.priv  = (void*)IDE_PRIMARY_BASE;
     storage_register_device(&ide0);
+    serial_puts("[IDE] capacity sectors=");
+    serial_u64(cap_sectors);
+    serial_puts("\n");
     serial_puts("[IDE] Registered ide0\n");
 }

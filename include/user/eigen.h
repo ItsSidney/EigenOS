@@ -58,7 +58,35 @@
 #define EIGEN_SYS_EPOLL    28   /* epoll: (sub-op, ...) level-triggered monitors */
 #define EIGEN_SYS_PIPE     29   /* pipe(2): (int[2] pipefd) -> 0 ok */
 #define EIGEN_SYS_FCNTL    30   /* fcntl(2): (fd, cmd, arg) -> val */
-#define EIGEN_SYS_COUNT    31
+#define EIGEN_SYS_SPAWN_FDS 31  /* spawn with fd inheritance:
+                                   a=name b=int32[3]{stdin,stdout,stderr parent fds} c=argv d=argc */
+#define EIGEN_SYS_SIGNAL      32
+#define EIGEN_SYS_KILL        33
+#define EIGEN_SYS_SIGRETURN   34
+#define EIGEN_SYS_OPENPTY     35   /* openpty(int fds[2]): 0=master 1=slave */
+#define EIGEN_SYS_FORK        36
+#define EIGEN_SYS_EXECVE      37
+#define EIGEN_SYS_WAIT4       38
+#define EIGEN_SYS_GETDENTS64  39
+#define EIGEN_SYS_READV       40
+#define EIGEN_SYS_WRITEV      41
+#define EIGEN_SYS_DUP2        42
+#define EIGEN_SYS_ARCH_PRCTL  43
+#define EIGEN_SYS_SET_TID_ADDR 44
+
+/* POSIX-style signal numbers (tier 1) */
+#ifndef NSIG
+#define NSIG      32
+#endif
+#define SIGINT     2
+#define SIGKILL    9
+#define SIGUSR1   10
+#define SIGSEGV   11
+#define SIGUSR2   12
+#define SIGTERM   15
+#define SIGWINCH 28
+
+#define EIGEN_SYS_COUNT    45
 
 /* EIGEN_SYS_EPOLL sub-operations */
 /* CREATE: () -> epoll id (1..32), owned by the calling process group */
@@ -147,6 +175,7 @@ typedef struct {
 /* Input syscall opcodes (r10 = opcode) */
 #define EIGEN_INPUT_KBHIT   0   /* returns 1 if a key is pending      */
 #define EIGEN_INPUT_GETCHAR 1   /* returns next key (0 if none)       */
+#define EIGEN_INPUT_MOUSE_DELTA 3 /* args: (dx_out, dy_out, btn_out) -> 0; raw mouse deltas */
 
 /* ------------------------------------------------------------------ */
 /* Window syscall sub-operations (arg1)                                */
@@ -262,6 +291,30 @@ static inline uint64_t eigen_syscall(uint64_t num, uint64_t a1, uint64_t a2,
         : "a"(num), "D"(a1), "S"(a2), "d"(a3), "r"(a4_reg)
         : "rcx", "r11", "memory");
     return ret;
+}
+extern int eigen_getpid(void);
+static inline int eigen_signal(int sig, void (*handler)(int)) {
+    return (int)eigen_syscall(EIGEN_SYS_SIGNAL, (uint64_t)sig,
+                              (uint64_t)(uintptr_t)handler, 0, 0);
+}
+static inline int eigen_kill(int pid, int sig) {
+    return (int)eigen_syscall(EIGEN_SYS_KILL, (uint64_t)pid,
+                              (uint64_t)sig, 0, 0);
+}
+static inline int eigen_raise(int sig) {
+    return eigen_kill(eigen_getpid(), sig);
+}
+static inline int eigen_openpty(int fds[2]) {
+    return (int)eigen_syscall(EIGEN_SYS_OPENPTY, (uint64_t)(uintptr_t)fds,
+                              0, 0, 0);
+}
+/* set foreground process group: ^C on this pty signals `pid` */
+#define EIGEN_F_PTYFG    1000
+#define EIGEN_F_PTYRAW   1001   /* arg=1 raw passthrough / 0 cooked */
+#define EIGEN_F_PTYWINSZ 1002   /* arg=(rows<<16)|cols */
+static inline int eigen_pty_setfg(int master_fd, int pid) {
+    return (int)eigen_syscall(EIGEN_SYS_FCNTL, (uint64_t)master_fd,
+                              EIGEN_F_PTYFG, (uint64_t)pid, 0);
 }
 
 #endif /* EIGEN_H */

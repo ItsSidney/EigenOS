@@ -25,6 +25,19 @@ void desk_add_app_icon(int app_idx);
 void desk_add_file_icon(const char* path, const char* display_name);
 void desk_remove_icon_by_path(const char* path);
 
+/* ── Comprehensive top taskbar + launcher (taskbar_mac.c) ────────── */
+/* Rendering happens in draw_taskbar_mac(); input is routed here so the
+   shell loop can prioritize the bar/launcher over windows:            */
+int  taskbar_handle_click(int cx, int cy, int clicked, int rclicked); /* 1=consumed */
+int  taskbar_handle_key(char key);                    /* 1=consumed   */
+int  taskbar_overlay_open(void);                      /* launcher/power popover */
+void taskbar_launcher_toggle(void);
+void taskbar_launcher_close(void);
+void taskbar_launcher_open_search(void);              /* open + focus search */
+/* Haiku-style cascading start menu (lambda button dropdown) */
+void taskbar_menu_toggle(void);
+void taskbar_menu_close(void);
+
 /* ── App launcher entry (shared between gui.c and taskbar_mac.c) ── */
 typedef struct {
     const char* name;
@@ -78,6 +91,7 @@ typedef enum {
     THEME_AURORA,          /* Aurora      — deep navy, teal-green accents     */
     THEME_CRIMSON,         /* Crimson     — very dark, deep red highlights    */
     THEME_OBSIDIAN,        /* Obsidian    — near-black purple-dark, silver    */
+    THEME_MIST,            /* Mist        — modern light grey, factory default*/
     THEME_COUNT
 } theme_id_t;
 
@@ -142,6 +156,7 @@ typedef struct {
     int wallpaper_id;          // procedural preset id (when wallpaper_mode==0)
     int wallpaper_mode;        // 0=procedural preset (wallpaper_id), 1=image file (wallpaper_file)
     char wallpaper_file[64];   // VFS path of active wallpaper image (mode==1)
+    char wallpaper_mod[16];    // Limine module name for shipped packs (mode==2)
     uint64_t taskbar_pinned_mask; // Bitmask of pinned apps (bits indexed by global_idx)
     uint64_t desktop_icons_mask;  // Bitmask of apps shown as desktop icons (bits indexed by global_idx)
 } personalization_t;
@@ -150,8 +165,8 @@ typedef struct {
    Global, live-editable taskbar layout. The Layout app edits a
    working copy and "Apply" commits it here; the taskbar reads this
    every frame. TASKBAR_DEFAULT_* are the canonical defaults. */
-#define TASKBAR_DEFAULT_POS   0   /* 0=bottom 1=top 2=left 3=right */
-#define TASKBAR_DEFAULT_SIZE  36
+#define TASKBAR_DEFAULT_POS   1   /* top — slim shell bar is drawn top-only */
+#define TASKBAR_DEFAULT_SIZE  20  /* ultra-slim polybar-style height */
 #define TASKBAR_DEFAULT_OPAC  255
 #define TASKBAR_DEFAULT_AH    0   /* autohide off */
 #define TASKBAR_DEFAULT_MON   1   /* live CPU/RAM monitor on */

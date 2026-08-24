@@ -113,10 +113,10 @@ int main(int argc, char** argv) {
         printf("[imguitest] DejaVuSans: %ld bytes\n", fsize);
 
         ImFontConfig cfg = {};
-        cfg.OversampleH = 1;  /* 1:1 display; 3x made the atlas 512x1024 and
+        cfg.OversampleH = 2;  /* 1:1 display; 3x made the atlas 512x1024 and
                                  likely OOM'd the shared kernel heap mid-bake */
-        cfg.OversampleV = 1;
-        cfg.GlyphOffset.y = 2.0f;
+        cfg.OversampleV = 2;
+        cfg.GlyphOffset.y = 0.0f;
         cfg.SizePixels = (float)FONT_PIXELS;
         cfg.RasterizerDensity = 1.0f;
         cfg.FontDataOwnedByAtlas = false;  /* atlas keeps our pointer, never copies */

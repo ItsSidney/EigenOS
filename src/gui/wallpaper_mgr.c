@@ -24,19 +24,23 @@
 #include "drivers/video/gfx.h"
 #include "drivers/video/framebuffer.h"
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* from kernel.c: look up a Limine module by its file basename (no extension) */
 extern int user_module_find(const char* name, const void** data, uint64_t* size);
+/* from kernel.c: enumerate every registered Limine module (dynamic wallpapers) */
+extern int user_module_total(void);
+extern int user_module_at(int idx, const char** name, const void** data, uint64_t* size);
 /* from gui.c: triggers the circular wallpaper-reveal animation on apply */
 extern void gui_wallpaper_apply_anim(void);
 
 /* forward declarations */
 static void load_manifest(void);
 
-/* ── package modules (Limine module basenames) ── */
-static const char* PKG_MODS[] = { "wp1", "wp2", "wp3", "wp4", "wp5" };
-#define N_PKG 5
+/* ── package modules ──
+ * The fixed wp1..wp5 list is GONE: seeding now walks the Limine module
+ * registry and installs every "wp*" module (see seed_packages below). */
 
 /* Wallpapers + config live in the user's home/wallpaper folder (so they show
  * up in File Explorer's Home view). Paths are ABSOLUTE (leading '/') because
@@ -73,25 +77,32 @@ static void basename_noext(const char* path, char* out, int outsz) {
 }
 
 /* ── seeding: copy each Limine module's bytes into home/wallpaper/ ── */
+/* Dynamic: EVERY registered boot module whose basename starts with "wp"
+ * (wp1, wp2, wpw1, …) is seeded as /home/user/wallpaper/<name>.bmp.
+ * Dropping a new src/assets/wallpapers/wp*.bmp into the build is enough —
+ * build.sh registers it as a Limine module and it shows up here.        */
 static void seed_packages(void) {
     if (ensure_dir_chain(WP_FOLDER) < 0) return;   /* folder must exist */
-    for (int i = 0; i < N_PKG; i++) {
+
+    int total = user_module_total();
+    for (int i = 0; i < total; i++) {
+        const char* name = 0;
+        const void* mdata = 0;
+        uint64_t msize = 0;
+        if (user_module_at(i, &name, &mdata, &msize) != 0) continue;
+        if (!name || name[0] != 'w' || name[1] != 'p' || !name[2]) continue;
+        if (!mdata || msize == 0) continue;
+
+        /* path: /home/user/wallpaper/<name>.bmp */
         char path[128];
-        path[0] = 0;
         int k = 0;
         const char* base = WP_SEED_PREFIX;
         while (*base && k < 110) path[k++] = *base++;
-        int p = 0; while (PKG_MODS[i][p] && k < 118) path[k++] = PKG_MODS[i][p++];
+        int p = 0; while (name[p] && k < 118) path[k++] = name[p++];
         path[k++] = '.'; path[k++] = 'b'; path[k++] = 'm'; path[k++] = 'p';
         path[k] = 0;
 
         if (fs_exists(path)) continue;           /* already installed */
-
-        /* locate the wallpaper as a Limine module (boot():/wallpapers/wpN.bmp) */
-        const void* mdata = 0;
-        uint64_t msize = 0;
-        if (user_module_find(PKG_MODS[i], &mdata, &msize) != 0 || !mdata || msize == 0)
-            continue;   /* module missing — skip this package */
 
         int fd = fs_create(path);
         if (fd < 0) continue;
@@ -222,19 +233,42 @@ void wallpaper_mgr_init(void) {
 /* Called from theme_init after prefs are reset: restores the wallpaper the
  * user last applied (from the manifest), or the first shipped package (wp5)
  * on a fresh boot so the OS never starts on the plain procedural gradient. */
+static int blit_probe_module(const char* mod);
 void wallpaper_mgr_apply_default(void) {
     personalization_t* p = get_personalization();
+
+    /* Shipped packs live as Limine modules - pick wp5 first, straight
+       from module memory. This path cannot be broken by VFS races. */
+    {
+        static const char* modpref[] = { "wp5","wp4","wp3","wp2","wp1",0 };
+        for (int i = 0; modpref[i]; i++) {
+            if (blit_probe_module(modpref[i])) {
+                p->wallpaper_mode = 2;
+                int k = 0;
+                while (modpref[i][k] && k < 15)
+                    { p->wallpaper_mod[k] = modpref[i][k]; k++; }
+                p->wallpaper_mod[k] = 0;
+                return;
+            }
+        }
+    }
     if (g_manifest_mode == 1 && g_manifest_active[0] && fs_exists(g_manifest_active)) {
         p->wallpaper_mode = 1;
         int k = 0; while (g_manifest_active[k] && k < 95) { p->wallpaper_file[k] = g_manifest_active[k]; k++; }
         p->wallpaper_file[k] = 0;
         return;
     }
-    if (fs_exists("/home/user/wallpaper/wp5.bmp")) {
-        p->wallpaper_mode = 1;
-        const char* s = "/home/user/wallpaper/wp5.bmp";
-        int k = 0; while (s[k] && k < 95) { p->wallpaper_file[k] = s[k]; k++; }
-        p->wallpaper_file[k] = 0;
+    /* prefer wp5 as boot default */
+    static const char* defaults[] = { "wp5", "wp4", "wp3", "wp2", "wp1", NULL };
+    for (int i = 0; defaults[i]; i++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/home/user/wallpaper/%s.bmp", defaults[i]);
+        if (fs_exists(path)) {
+            p->wallpaper_mode = 1;
+            int k = 0; while (path[k] && k < 95) { p->wallpaper_file[k] = path[k]; k++; }
+            p->wallpaper_file[k] = 0;
+            break;
+        }
     }
 }
 
@@ -422,34 +456,97 @@ void wallpaper_mgr_draw_region(const void* img, int x, int y, int w, int h) {
             dst[xx] = 0xFF000000U | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];
         }
     }
+
+}
+static int wp_blit_cover(const bmp_image_t* im, uint32_t* dst, int stride, int cw, int ch);
+
+/* Blit a shipped wallpaper straight from its Limine module bytes -
+ * no VFS involvement, immune to seed/path races. */
+extern int user_module_total(void);
+extern int user_module_at(int idx, const char** name, const void** data,
+                          uint64_t* size);
+static int blit_module_named(const char* mod, uint32_t* dst, int stride,
+                             int cw, int ch) {
+    int total = user_module_total();
+    for (int i = 0; i < total; i++) {
+        const char* name = 0; const void* data = 0; uint64_t size = 0;
+        if (user_module_at(i, &name, &data, &size) != 0) continue;
+        if (!name || !data || strcmp(name, mod) != 0) continue;
+        if (size < 64 || ((const uint8_t*)data)[0] != 'B'
+                      || ((const uint8_t*)data)[1] != 'M') return 0;
+        bmp_image_t img; img.pixels = 0;
+        if (!bmp_decode((const uint8_t*)data, (int)size, &img)) return 0;
+        int rc = wp_blit_cover(&img, dst, stride, cw, ch);
+        bmp_free(&img);
+        return rc;
+    }
+    return 0;
 }
 
-void wallpaper_mgr_blit_active(uint32_t* dst, int stride, int cw, int ch) {
+int wallpaper_mgr_blit_active(uint32_t* dst, int stride, int cw, int ch) {
     personalization_t* p = get_personalization();
-    if (p->wallpaper_mode != 1 || !p->wallpaper_file[0]) return;
-    bmp_image_t img; img.pixels = 0;
-    int ok = wallpaper_mgr_decode_file(p->wallpaper_file, &img);
-    if (!ok) {
-        /* fallback gradient so the desktop is never pure black */
-        for (int yy = 0; yy < ch; yy++) {
-            uint32_t* d = dst + yy * stride;
-            uint32_t c = 0xFF000000U | (0x101820 + (yy * 0x20 / ch));
-            for (int xx = 0; xx < cw; xx++) d[xx] = c;
+    if (p->wallpaper_mode == 1 && p->wallpaper_file[0]) {
+        bmp_image_t img; img.pixels = 0;
+        if (wallpaper_mgr_decode_file(p->wallpaper_file, &img)) {
+            int rc = wp_blit_cover(&img, dst, stride, cw, ch);
+            bmp_free(&img);
+            if (rc) return 1;
         }
-        return;
     }
-    int iw = img.width, ih = img.height;
+    /* active file failed: try every other registered package before
+     * giving up, so the desktop always gets a real photo if one exists */
+    for (int i = 0; i < g_count; i++) {
+        if (!g_list[i].path[0]) continue;
+        if (p->wallpaper_mode == 1 &&
+            strcmp(g_list[i].path, p->wallpaper_file) == 0) continue;
+        bmp_image_t img; img.pixels = 0;
+        if (!wallpaper_mgr_decode_file(g_list[i].path, &img)) continue;
+        int rc = wp_blit_cover(&img, dst, stride, cw, ch);
+        bmp_free(&img);
+        if (rc) {
+            /* adopt this one as active so it persists visually */
+            int k = 0; while (g_list[i].path[k] && k < 95)
+                { p->wallpaper_file[k] = g_list[i].path[k]; k++; }
+            p->wallpaper_file[k] = 0;
+            p->wallpaper_mode = 1;
+            return 1;
+        }
+    }
+    /* last resort gradient */
+    for (int yy = 0; yy < ch; yy++) {
+        uint32_t* d = dst + yy * stride;
+        uint32_t c = 0xFF000000U | (0x101820 + (yy * 0x20 / ch));
+        for (int xx = 0; xx < cw; xx++) d[xx] = c;
+    }
+    return 0;
+}
+
+static int blit_probe_module(const char* mod) {
+    int total = user_module_total();
+    for (int i = 0; i < total; i++) {
+        const char* name = 0; const void* data = 0; uint64_t size = 0;
+        if (user_module_at(i, &name, &data, &size) != 0) continue;
+        if (name && strcmp(name, mod) == 0 && data && size > 64 &&
+            ((const uint8_t*)data)[0]=='B' && ((const uint8_t*)data)[1]=='M')
+            return 1;
+    }
+    return 0;
+}
+
+static int wp_blit_cover(const bmp_image_t* im, uint32_t* dst, int stride,
+                         int cw, int ch) {
+    int iw = im->width, ih = im->height;
     /* Full-screen COVER: the photo always fills the ENTIRE screen (cropped
      * when the aspect ratios differ) — no bars, no letterbox, no mid-screen
      * slab. Renders once per wallpaper change, then is cached. */
-    if (iw <= 0 || ih <= 0) { bmp_free(&img); return; }
+    if (iw <= 0 || ih <= 0 || !im->pixels) return 0;
     int sw, sh, ox = 0, oy = 0;
     if ((long)ch * iw >= (long)cw * ih) { sh = ch; sw = (int)((long)ch * iw / ih); ox = (cw - sw) / 2; }
     else                                { sw = cw; sh = (int)((long)cw * ih / iw); oy = (ch - sh) / 2; }
     for (int yy = 0; yy < ch; yy++) {
         int sy = (yy - oy) * ih / sh;
         if (sy < 0) sy = 0; else if (sy >= ih) sy = ih - 1;
-        const uint8_t* row = img.pixels + (long)sy * iw * 3;
+        const uint8_t* row = im->pixels + (long)sy * iw * 3;
         uint32_t* d = dst + yy * stride;
         for (int xx = 0; xx < cw; xx++) {
             int sx = (xx - ox) * iw / sw;
@@ -458,5 +555,4 @@ void wallpaper_mgr_blit_active(uint32_t* dst, int stride, int cw, int ch) {
             d[xx] = 0xFF000000U | ((uint32_t)pp[0] << 16) | ((uint32_t)pp[1] << 8) | pp[2];
         }
     }
-    bmp_free(&img);
 }

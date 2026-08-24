@@ -15,3 +15,6 @@ backups/
 
 # Old rust experiment
 src/rust/target/
+
+# generated disk image (too large for GitHub)
+eigen_disk.img

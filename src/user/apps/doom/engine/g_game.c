@@ -441,6 +441,9 @@ void G_BuildTiccmd (ticcmd_t* cmd, int maketic)
 	dclicks = 0;                   
     } 
 
+    if (gamekeydown[key_jump] || mousebuttons[mousebjump] || joybuttons[joybjump])
+        cmd->buttons |= BT2_JUMP;
+
     // If the previous or next weapon button is pressed, the
     // next_weapon variable is set to change weapons when
     // we generate a ticcmd.  Choose a new weapon.

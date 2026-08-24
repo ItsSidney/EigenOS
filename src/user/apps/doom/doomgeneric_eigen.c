@@ -44,6 +44,29 @@ static int      g_ww = 640, g_wh = 400;   /* requested window size       */
 static uint8_t* g_wad = 0;
 static uint64_t g_wad_len = 0;
 
+/* Per-name WAD cache: each registered boot module (e.g. "doom2", "tnt") is
+   loaded into its own buffer so multiple IWADs/PWADs can coexist and the engine
+   gets the correct bytes for the name it requested. */
+#define MAX_WAD_SLOTS 12
+typedef struct { char name[32]; uint8_t* buf; uint64_t len; } wad_slot_t;
+static wad_slot_t g_wads[MAX_WAD_SLOTS];
+static int g_wads_n = 0;
+
+static int wad_cache_add(const char* name, uint8_t* buf, uint64_t len) {
+    if (g_wads_n >= MAX_WAD_SLOTS) return -1;
+    strncpy(g_wads[g_wads_n].name, name, 31);
+    g_wads[g_wads_n].name[31] = 0;
+    g_wads[g_wads_n].buf = buf;
+    g_wads[g_wads_n].len = len;
+    g_wads_n++;
+    return 0;
+}
+static uint8_t* wad_cache_find(const char* name, uint64_t* len) {
+    for (int i = 0; i < g_wads_n; i++)
+        if (strcmp(g_wads[i].name, name) == 0) { *len = g_wads[i].len; return g_wads[i].buf; }
+    return 0;
+}
+
 /* Key translation: array indexed by scancode-set-1 code -> DOOM keycode.
    The WM enqueues set-1 scancodes in ev->a, so index == scancode. */
 /* Kernel key code -> DOOM keycode. The kernel delivers ASCII characters
@@ -63,7 +86,8 @@ static unsigned char k2doom(unsigned char sc) {
     if (sc == 138)                return KEY_END;      /* KEY_END */
     if (sc == 133)                return KEY_PGUP;     /* KEY_PAGE_UP */
     if (sc == 134)                return KEY_PGDN;     /* KEY_PAGE_DOWN */
-    if (sc == ' ')                return KEY_USE;      /* space = use */
+    if (sc == ' ')                return KEY_SPACE;    /* space = jump */
+    if (sc == 'e' || sc == 'E')   return KEY_USE;      /* E = use */
     if (sc >= 1 && sc <= 26)      return KEY_FIRE;     /* ctrl+letter = fire */
     if (sc == 29)                 return KEY_FIRE;     /* plain ctrl (sc 0x1D) */
     if (sc == 'w' || sc == 'W')   return KEY_UPARROW;  /* WASD */
@@ -110,20 +134,38 @@ void DG_Init(void) {
     eigen_win_getsize(g_win, (uint32_t*)&g_cw, (uint32_t*)&g_ch);
     eigen_printf("[DOOM] window content %dx%d (frame %dx%d)\n", g_cw, g_ch, g_ww, g_wh);
 
-    /* Load the WAD from a boot module. */
-    g_wad = (uint8_t*)eigen_malloc(8 * 1024 * 1024);
-    if (g_wad) {
-        long n = eigen_load_module("doom1", g_wad, 8 * 1024 * 1024);
-        if (n > 0) { g_wad_len = (uint64_t)n; eigen_printf("[DOOM] loaded WAD: %ld bytes\n", n); }
-        else {
-            eigen_printf("[DOOM] FATAL: doom1.wad module not found.\n");
-            eigen_printf("[DOOM] Place doom1.wad (shareware) in bin/iso_root/ and add:\n");
-            eigen_printf("        module_path: boot():/user/doom1.wad\n");
-            eigen_printf("        to config/limine.conf, then rebuild.\n");
-            draw_error("doom1.wad not found in boot modules.");
-            for (;;) eigen_sleep_ms(1000);   /* stay open so the error is visible */
+    /* Load IWADs the user registered as boot modules. FreeDoom (fully free,
+       open-source, 30/32 levels) is preferred; the shareware doom1 is a
+       fallback. The engine auto-detects the IWAD via FS; W_OpenFile resolves
+       the name to the right buffer here. Add more maps by dropping a .wad into
+       bin/iso_root/user/ AND registering the module (basename, no extension) in
+       config/limine.conf. */
+    static const char* cands[] = { "freedoom1", "freedoom2", "freedm",
+                                   "doom2", "plutonia", "tnt", "doom",
+                                   "heretic", "doom1", 0 };
+    for (int i = 0; cands[i]; i++) {
+        uint8_t* b = (uint8_t*)eigen_malloc(64 * 1024 * 1024);
+        if (!b) continue;
+        long n = eigen_load_module(cands[i], b, 64 * 1024 * 1024);
+        if (n > 0) {
+            wad_cache_add(cands[i], b, (uint64_t)n);
+            if (!g_wad) { g_wad = b; g_wad_len = (uint64_t)n; }
+            eigen_printf("[DOOM] loaded WAD %s: %ld bytes\n", cands[i], n);
+        } else {
+            eigen_free(b);
         }
     }
+
+    if (!g_wad) {
+        eigen_printf("[DOOM] FATAL: no IWAD boot module found.\n");
+        eigen_printf("[DOOM] Place freedoom1.wad (free, https://freedoom.github.io)\n");
+        eigen_printf("[DOOM] in bin/iso_root/user/ and add:\n");
+        eigen_printf("        module_path: boot():/user/freedoom1.wad\n");
+        eigen_printf("        to config/limine.conf, then rebuild.\n");
+        draw_error("no IWAD found in boot modules.");
+        for (;;) eigen_sleep_ms(1000);   /* stay open so the error is visible */
+    }
+
     eigen_printf("[DOOM] DG_Init done\n");
 }
 
@@ -193,6 +235,16 @@ int DG_GetKey(int* pressed, unsigned char* key) {
     return 1;
 }
 
+int DG_GetMouse(int* buttons, int* dx, int* dy) {
+    static int prev_b = 0;
+    int b = 0, ddx = 0, ddy = 0;
+    eigen_mouse_delta(&ddx, &ddy, &b);
+    if (ddx == 0 && ddy == 0 && b == prev_b) return 0;
+    *buttons = b; *dx = ddx; *dy = ddy;
+    prev_b = b;
+    return 1;
+}
+
 void DG_SetWindowTitle(const char* title) { (void)title; }
 
 /* ===== i_system shims ===== */
@@ -248,10 +300,7 @@ void I_StopSong(void) {}
 boolean I_MusicIsPlaying(void) { return 0; }
 void I_BindSoundVariables(void) {}
 
-/* ===== WAD: in-memory class backed by the boot module ===== */
-static uint8_t* g_wad_base = 0;
-static uint64_t g_wad_len0 = 0;
-
+/* ===== WAD: in-memory class backed by boot modules ===== */
 static size_t eigen_wad_read(wad_file_t* wad, unsigned int offset, void* buf, size_t n);
 static void eigen_wad_close(wad_file_t* wad);
 static wad_file_t* eigen_wad_open(char* path);
@@ -261,23 +310,33 @@ static wad_file_class_t eigen_wad_class = {
 };
 
 static wad_file_t* eigen_wad_open(char* path) {
-    (void)path;
-    if (!g_wad || g_wad_len == 0) return 0;
-    g_wad_base = g_wad;
-    g_wad_len0 = g_wad_len;
+    /* Resolve the requested name (e.g. "doom2.wad" or "/user/doom2.wad") to a
+       loaded boot-module buffer. Falls back to the legacy single g_wad. */
+    char base[32];
+    const char* p = strrchr(path, '/');
+    p = p ? p + 1 : path;
+    strncpy(base, p, 31); base[31] = 0;
+    size_t L = strlen(base);
+    if (L > 4 && strcmp(base + L - 4, ".wad") == 0) base[L - 4] = 0;
+
+    uint64_t len = 0;
+    uint8_t* buf = wad_cache_find(base, &len);
+    if (!buf) {
+        if (!g_wad || g_wad_len == 0) return 0;
+        buf = g_wad; len = g_wad_len;
+    }
     wad_file_t* wf = (wad_file_t*)eigen_malloc(sizeof(wad_file_t));
     if (!wf) return 0;
     wf->file_class = &eigen_wad_class;
-    wf->mapped = 0;
-    wf->length = (unsigned int)g_wad_len;
+    wf->mapped = buf;
+    wf->length = (unsigned int)len;
     return wf;
 }
 static void eigen_wad_close(wad_file_t* wad) { if (wad) eigen_free(wad); }
 static size_t eigen_wad_read(wad_file_t* wad, unsigned int offset, void* buf, size_t n) {
-    (void)wad;
-    if (offset >= g_wad_len0) return 0;
-    if (offset + n > g_wad_len0) n = (size_t)(g_wad_len0 - offset);
-    memcpy(buf, g_wad_base + offset, n);
+    if (offset >= wad->length) return 0;
+    if (offset + n > wad->length) n = (size_t)(wad->length - offset);
+    memcpy(buf, wad->mapped + offset, n);
     return n;
 }
 

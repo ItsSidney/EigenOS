@@ -25,6 +25,25 @@ int elf_load(const void* data, uint64_t size, uint64_t* entry_out) {
     __builtin_memcpy(&magic, eh->e_ident, 4);
     if (magic != ELF_MAGIC || eh->e_ident[4] != ELF_CLASS64) return -1;
     if (eh->e_type != ELF_ET_EXEC) return -1;
+    /* x86_64-only, sane phdr table, no interp (static binaries only). */
+    if (eh->e_machine != 62 /* EM_X86_64 */) return -1;
+    if (eh->e_phentsize != sizeof(elf64_phdr_t)) return -1;
+    if (eh->e_phnum == 0 || eh->e_phnum > 1024) return -1;
+
+    uint64_t total_memsz = 0;
+
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const elf64_phdr_t* phchk =
+            (const elf64_phdr_t*)((const uint8_t*)data + eh->e_phoff
+                                  + (uint64_t)i * sizeof(elf64_phdr_t));
+        if (phchk->p_type == 3 /* PT_INTERP */) return -1;   /* no dynamic loader */
+
+        if (phchk->p_type == PT_LOAD) {
+            if (phchk->p_memsz > (256ULL << 20)) return -1;      /* 256 MB/seg */
+            total_memsz += phchk->p_memsz;
+            if (total_memsz > (512ULL << 20)) return -1;         /* 512 MB/img */
+        }
+    }
 
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         uint64_t phoff = eh->e_phoff + (uint64_t)i * eh->e_phentsize;
@@ -36,8 +55,9 @@ int elf_load(const void* data, uint64_t size, uint64_t* entry_out) {
         uint64_t vend  = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~(0xFFFULL);
         if (vend <= vaddr) continue;
 
-        /* Reject collisions with the kernel image region. */
-        if (vaddr >= 0xffffffff80000000ULL) return -1;
+        /* User range only: keep the null page unmapped and stay out of
+           both the kernel region and any wrap-around fantasy lands. */
+        if (vaddr < 0x400000ULL || vend > 0x800000000000ULL) return -1;
 
         for (uint64_t cur = vaddr; cur < vend; cur += 4096) {
             uint64_t phys = pmm_alloc();

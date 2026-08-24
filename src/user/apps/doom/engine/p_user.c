@@ -150,6 +150,9 @@ void P_MovePlayer (player_t* player)
     //  if not onground.
     onground = (player->mo->z <= player->mo->floorz);
 	
+    if ((cmd->buttons & BT2_JUMP) && onground && player->mo->momz <= 0)
+        player->mo->momz = 8 * FRACUNIT;
+
     if (cmd->forwardmove && onground)
 	P_Thrust (player, player->mo->angle, cmd->forwardmove*2048);
     

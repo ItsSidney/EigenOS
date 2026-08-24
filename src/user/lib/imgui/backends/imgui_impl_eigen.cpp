@@ -305,13 +305,15 @@ extern "C" void ImGui_ImplEigen_ProcessEvent(const eigen_ev_t* ev) {
     ImGuiIO& io = ImGui::GetIO();
     switch (ev->type) {
         case EIGEN_EV_MMOVE:
-            io.MousePos = ImVec2((float)ev->a, (float)ev->b);
+            io.AddMousePosEvent((float)ev->a, (float)ev->b);
             break;
         case EIGEN_EV_MDOWN:
-            if (ev->a >= 0 && ev->a < 5) { io.MouseDown[ev->a] = true; }
+            io.AddMousePosEvent((float)ev->a, (float)ev->b);
+            if (ev->c >= 1 && ev->c <= 3) io.AddMouseButtonEvent(ev->c - 1, true);
             break;
         case EIGEN_EV_MUP:
-            if (ev->a >= 0 && ev->a < 5) { io.MouseDown[ev->a] = false; }
+            io.AddMousePosEvent((float)ev->a, (float)ev->b);
+            if (ev->c >= 1 && ev->c <= 3) io.AddMouseButtonEvent(ev->c - 1, false);
             break;
         case EIGEN_EV_KEY: {
             int sc = ev->a & 0xFF;
@@ -325,10 +327,12 @@ extern "C" void ImGui_ImplEigen_ProcessEvent(const eigen_ev_t* ev) {
             else if (sc == 1) 	key = ImGuiKey_Escape;
             else if (sc == 73) 	key = ImGuiKey_Space;
             else if (sc == 75) 	key = ImGuiKey_Backspace;
-            if (sc == 128) io.MouseWheel -= 1.0f;
-            if (sc == 129) io.MouseWheel += 1.0f;
+            if (sc == 128 && down) io.AddMouseWheelEvent(0, -1.0f);
+            if (sc == 129 && down) io.AddMouseWheelEvent(0, +1.0f);
             if (key != ImGuiKey_None)
                 io.AddKeyEvent(key, down);
+            if (down && sc >= 32 && sc < 127)
+                io.AddInputCharacter((ImWchar)sc);
             break;
         }
         default:

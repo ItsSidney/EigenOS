@@ -32,6 +32,7 @@
 #define KEY_STRAFE_R	0xa1
 #define KEY_USE			0xa2
 #define KEY_FIRE		0xa3
+#define KEY_SPACE		0xa4
 #define KEY_ESCAPE		27
 #define KEY_ENTER		13
 #define KEY_TAB			9

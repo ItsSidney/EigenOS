@@ -353,57 +353,67 @@ char* getcwd(char* buf, size_t size) {
 }
 
 /* ===================== directories ===================== */
+/* REAL getdents64-based directory reads (kernel SYS_getdents64). */
+#include "eigen.h"
+#include <fcntl.h>
+#include <unistd.h>
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0200000
+#endif
+#ifndef EIGEN_SYS_GETDENTS64
+#define EIGEN_SYS_GETDENTS64 39
+#endif
+struct eigen_dirent64 {
+    unsigned long long d_ino;
+    long long          d_off;
+    unsigned short     d_reclen;
+    unsigned char      d_type;
+    char               d_name[];
+};
+
 struct DIR {
-    int    index;               /* next byte to parse in buf[] */
-    int    end;                 /* buffer length                */
-    struct dirent cur;
-    char   buf[8192];
+    int            fd;
+    int            pos;        /* byte offset into buf */
+    int            end;        /* valid bytes in buf   */
+    struct dirent  cur;
+    char           buf[4096];
 };
 
 DIR* opendir(const char* path) {
-    (void)path;   /* the eigen FS has a single current directory */
+    int fd = open(path[0] ? path : "/", O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return 0;
     DIR* d = (DIR*)eigen_malloc(sizeof(DIR));
-    if (!d) { errno = ENOMEM; return 0; }
-    d->index = 0;
-    d->end = eigen_fs_list(d->buf, (int)sizeof(d->buf) - 1);
-    if (d->end < 0) { eigen_free(d); errno = EIO; return 0; }
-    d->buf[d->end] = 0;
+    if (!d) { close(fd); errno = ENOMEM; return 0; }
+    d->fd = fd; d->pos = 0; d->end = 0;
     return d;
 }
 
-/* Skip one ANSI escape sequence "\e[...m" if present at buf[i]. */
-static int skip_ansi(const char* s, int i) {
-    if (s[i] != '\033' && s[i] != '\e') return i;
-    int j = i + 1;
-    if (s[j] != '[') return i;
-    j++;
-    while (s[j] && s[j] != 'm') j++;
-    return s[j] ? j + 1 : j;
-}
-
-struct dirent* readdir(DIR* d) {
-    if (!d || d->index >= d->end) return 0;
-    const char* s = d->buf;
-    int j = skip_ansi(s, d->index);
-    int name_len = 0;
-    int is_dir = 0;
-    while (j < d->end && s[j] != '\n') {
-        if (s[j] == '\033' || s[j] == '\e') { j = skip_ansi(s, j); continue; }
-        if (s[j] == '/') { is_dir = 1; j++; continue; }   /* dir marker */
-        if (name_len < 255) d->cur.d_name[name_len] = s[j];
-        name_len++;
-        j++;
+struct dirent* readdir(DIR* dir) {
+    if (!dir || dir->fd < 0) return 0;
+    if (dir->pos >= dir->end) {
+        long n = (long)eigen_syscall(EIGEN_SYS_GETDENTS64,
+                    (unsigned long)dir->fd,
+                    (unsigned long)(uintptr_t)dir->buf,
+                    (unsigned long)sizeof(dir->buf), 0);
+        if (n <= 0) return 0;
+        dir->pos = 0; dir->end = (int)n;
     }
-    d->cur.d_name[name_len] = 0;
-    d->index = (j < d->end) ? j + 1 : d->end;
-    d->cur.d_ino = (long)d->index;
-    if (name_len == 0) return readdir(d);   /* skip empty lines */
-    return &d->cur;
+    struct eigen_dirent64* de =
+        (struct eigen_dirent64*)(dir->buf + dir->pos);
+    if (!de->d_reclen) return 0;
+    int i = 0;
+    while (de->d_name[i] && i < 255) { dir->cur.d_name[i] = de->d_name[i]; i++; }
+    dir->cur.d_name[i] = 0;
+    dir->cur.d_ino = (long)de->d_ino;
+    dir->pos += de->d_reclen;
+    return &dir->cur;
 }
 
 int closedir(DIR* d) {
-    if (d) eigen_free(d);
-    return 0;
+    if (!d) return -1;
+    int r = close(d->fd);
+    eigen_free(d);
+    return r;
 }
 
 /* ===================== dlopen/dlsym (stubs) ===================== */
@@ -551,9 +561,109 @@ int epoll_wait(int epid, struct epoll_event* events, int maxevents, int timeout_
 #include <strings.h>
 
 int isatty(int fd) {
-    (void)fd;
-    return 0;   /* no terminals in EigenOS ring-3 */
+    /* console fds are character devices — ports gate raw-mode setup on it */
+    return (fd >= 0 && fd <= 2) ? 1 : 0;
 }
+
+/* ── termios (tier 1): per-process state over the raw console ── */
+#include <termios.h>
+#include <user/eigen.h>
+
+static struct termios g_tio;
+static int            g_tio_init = 0;
+
+static void tio_defaults(struct termios* t) {
+    memset(t, 0, sizeof(*t));
+    t->c_iflag = ICRNL | IXON | IMAXBEL | IUTF8;
+    t->c_oflag = OPOST | ONLCR;
+    t->c_cflag = CS8 | CREAD | CLOCAL;
+    t->c_lflag = ISIG | ICANON | ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | IEXTEN;
+    t->c_line  = 0;
+    t->c_cc[VEOF]   = 4;   /* ^D */
+    t->c_cc[VERASE] = 127; /* DEL */
+    t->c_cc[VINTR]  = 3;   /* ^C */
+    t->c_cc[VQUIT]  = 28;  /* ^\ */
+    t->c_cc[VSUSP]  = 26;  /* ^Z */
+    t->c_cc[VMIN]   = 1;
+    t->c_cc[VTIME]  = 0;
+    t->c_ispeed = B38400;
+    t->c_ospeed = B38400;
+}
+
+int tcgetattr(int fd, struct termios* t) {
+    if (!t) { errno = EINVAL; return -1; }
+    if (!g_tio_init) { tio_defaults(&g_tio); g_tio_init = 1; }
+    *t = g_tio;
+    return (fd >= 0) ? 0 : (-1);
+}
+
+#ifndef EIGEN_F_PTYRAW
+#define EIGEN_F_PTYRAW 1001
+#endif
+int tcsetattr(int fd, int action, const struct termios* t) {
+    (void)action;
+    if (!t) { errno = EINVAL; return -1; }
+    int was_raw = (g_tio_init && !(g_tio.c_lflag & ICANON));
+    int now_raw = (t->c_lflag & ICANON) ? 0 : 1;
+    g_tio = *t;
+    g_tio_init = 1;
+    if (fd >= 3 && was_raw != now_raw)
+        fcntl(fd, EIGEN_F_PTYRAW, now_raw);   /* kernel line-discipline flip */
+    return 0;
+}
+
+static int g_rows = 24, g_cols = 80;
+
+/* terminal size for TUIs: rows/cols packed via fcntl */
+int eigen_get_winsize(int fd, int* rows, int* cols) {
+    extern int fcntl(int, int, ...);
+    /* kernel stores it; expose via F_GETFL-style read is not wired — the
+       app told US the size when it resized. Return last-known defaults. */
+    (void)fd;
+    if (rows) *rows = g_rows; if (cols) *cols = g_cols;
+    return 0;
+}
+void eigen_set_winsize(int fd, int rows, int cols) {
+    extern int fcntl(int, int, ...);
+    g_rows = rows; g_cols = cols;
+    #ifndef EIGEN_F_PTYWINSZ
+    #define EIGEN_F_PTYWINSZ 1002
+    #endif
+    if (fd >= 0) fcntl(fd, EIGEN_F_PTYWINSZ, ((rows & 0xFFFF) << 16) | (cols & 0xFFFF));
+}
+
+void cfmakeraw(struct termios* t) {
+    if (!t) return;
+    t->c_iflag &= ~(unsigned)(IGNBRK|BRKINT|PARMRK|ISTRIP|INLCR|IGNCR|
+                              ICRNL|IXON);
+    t->c_oflag &= ~OPOST;
+    t->c_lflag &= ~(unsigned)(ECHO|ECHONL|ICANON|ISIG|IEXTEN);
+    t->c_cflag &= ~(unsigned)(CSIZE|PARENB);
+    t->c_cflag |= CS8 | CREAD;
+    t->c_cc[VMIN]  = 1;
+    t->c_cc[VTIME] = 0;
+}
+
+void cfmakeraw_nux(struct termios* t) { /* alias some ports expect */
+    cfmakeraw(t);
+}
+
+speed_t cfgetispeed(const struct termios* t){ return t ? t->c_ispeed : 0; }
+speed_t cfgetospeed(const struct termios* t){ return t ? t->c_ospeed : 0; }
+int cfsetispeed(struct termios* t, speed_t s){ if(!t){errno=EINVAL;return -1;} t->c_ispeed=s; return 0; }
+int cfsetospeed(struct termios* t, speed_t s){ if(!t){errno=EINVAL;return -1;} t->c_ospeed=s; return 0; }
+
+int tcflush(int fd, int queue) {
+    (void)fd;
+    if (queue == TCIFLUSH || queue == TCIOFLUSH) {
+        /* drain the console input queue for real */
+        eigen_syscall(EIGEN_SYS_INPUT, EIGEN_INPUT_DRAIN, 0, 0, 0);
+    }
+    return 0;
+}
+int tcdrain(int fd)        { (void)fd; return 0; }
+int tcsendbreak(int f,int d){ (void)f;(void)d; return 0; }
+pid_t tcgetsid(int fd)     { (void)fd; errno = ENOSYS; return -1; }
 
 int access(const char* path, int mode) {
     (void)mode;

@@ -11,6 +11,7 @@
  * Entry `_start` calls main(argc, argv) then eigen_exit().
  */
 #include "userlib.h"
+#include <stdint.h>
 #include <stdarg.h>
 
 /* ------------------------------------------------------------------ */
@@ -76,6 +77,12 @@ int eigen_spawn(const char* name) { return (int)eigen_syscall(EIGEN_SYS_SPAWN, (
  * The kernel copies the strings into the new process's stack. */
 int eigen_spawn_args(const char* name, int argc, char* const argv[]) {
     return (int)eigen_syscall(EIGEN_SYS_SPAWN, (uint64_t)name, 0, (uint64_t)argv, (uint64_t)argc);
+}
+
+int eigen_spawn_fds(const char* name, int argc, char* const argv[], const int fds[3]) {
+    return (int)eigen_syscall(EIGEN_SYS_SPAWN_FDS, (uint64_t)name,
+                              (uint64_t)(uintptr_t)fds,
+                              (uint64_t)(uintptr_t)argv, (uint64_t)argc);
 }
 int eigen_wait(int pid, int* exit_code_out) {
     int r = (int)eigen_syscall(EIGEN_SYS_WAIT, (uint64_t)pid, 0, 0, 0);
@@ -159,6 +166,10 @@ int eigen_gfx_swap(void) { return (int)eigen_syscall(EIGEN_SYS_GFX, EIGEN_GFX_SW
 
 int eigen_kbhit(void)  { return (int)eigen_syscall(EIGEN_SYS_INPUT, EIGEN_INPUT_KBHIT, 0, 0, 0); }
 int eigen_getchar(void){ return (int)eigen_syscall(EIGEN_SYS_INPUT, EIGEN_INPUT_GETCHAR, 0, 0, 0); }
+int eigen_mouse_delta(int* dx, int* dy, int* buttons) {
+    return (int)eigen_syscall(EIGEN_SYS_INPUT, EIGEN_INPUT_MOUSE_DELTA,
+        (uint64_t)(uintptr_t)dx, (uint64_t)(uintptr_t)dy, (uint64_t)(uintptr_t)buttons);
+}
 
 int eigen_beep(uint32_t freq_hz, uint32_t dur_ms) {
     return (int)eigen_syscall(EIGEN_SYS_BEEP, freq_hz, dur_ms, 0, 0);
@@ -412,3 +423,11 @@ int eigen_dns_resolve(const char* host, uint32_t* ip_out) {
 void eigen_net_poll(void) {
     eigen_syscall(EIGEN_SYS_NET, EIGEN_NET_POLL, 0, 0, 0);
 }
+/* ── Signals ────────────────────────────────────────────────── */
+#include <user/eigen.h>
+int kill(int pid, int sig) {
+    return (int)eigen_syscall(EIGEN_SYS_KILL,
+                              (unsigned long)pid,
+                              (unsigned long)sig, 0, 0);
+}
+int raise(int sig) { return kill(eigen_getpid(), sig); }

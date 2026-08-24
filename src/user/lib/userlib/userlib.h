@@ -36,6 +36,9 @@ int  eigen_wall_thumb_raw(int idx, uint8_t* dst96x54);  /* 0 ok */
 int  eigen_getpid(void);
 int eigen_spawn(const char* name); /* spawn a boot module by basename        */
 int eigen_spawn_args(const char* name, int argc, char* const argv[]);            /* returns child PID or <0  */
+/* Spawn with fd inheritance: fds[0..2] = parent fds for child stdin/stdout/
+   stderr (-1 = closed). Pipes make this the shell/pipe building block.     */
+int eigen_spawn_fds(const char* name, int argc, char* const argv[], const int fds[3]);
 int  eigen_wait(int pid, int* exit_code_out);  /* returns 0 on success     */
 void eigen_exit(int code);
 
@@ -85,6 +88,7 @@ void* eigen_font_map(void);                  /* user VMA of font8x16 */
 /* Input (non-blocking) */
 int  eigen_kbhit(void);
 int  eigen_getchar(void);
+int  eigen_mouse_delta(int* dx, int* dy, int* buttons);
 
 /* Audio (PC speaker) */
 int  eigen_beep(uint32_t freq_hz, uint32_t dur_ms);
@@ -130,6 +134,11 @@ int  eigen_puts(const char* s);
 size_t eigen_strlen(const char* s);
 void   eigen_memset(void* p, int c, size_t n);
 void   eigen_memcpy(void* dst, const void* src, size_t n);
+/* ── Signals (POSIX names over SYS_SIGNAL/SYS_KILL) ─────────── */
+extern int eigen_getpid(void);
+int kill(int pid, int sig);
+int raise(int sig);
+
 /* ── Networking ─────────────────────────────────────────────── */
 int  eigen_socket(int domain, int type, int protocol);
 int  eigen_connect(int sock, uint32_t ip, uint16_t port);

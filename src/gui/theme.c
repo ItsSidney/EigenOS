@@ -321,6 +321,50 @@ static const theme_def_t THEME_OBSIDIAN_DEF = {
     8  /* violet-silver accent */
 };
 
+/* ══════════════════════════════════════════════════════════════════════
+ * Theme 7 — NORD  (factory default)
+ * Polar-night blues matched to the Nordzy icon theme. Square, compact,
+ * standard chrome: zero corner radius, minimal buttons, frost accent.
+ * ════════════════════════════════════════════════════════════════════ */
+static const theme_def_t THEME_MIST_DEF = {
+    "Nord",
+    {
+        [THEME_ROLE_BACKGROUND]        = 0x2E3440,
+        [THEME_ROLE_SURFACE]           = 0x3B4252,
+        [THEME_ROLE_SURFACE_VARIANT]   = 0x434C5E,
+        [THEME_ROLE_PRIMARY]           = 0xECEFF4,
+        [THEME_ROLE_ON_PRIMARY]        = 0x2E3440,
+        [THEME_ROLE_SECONDARY]         = 0x9CA6B8,
+        [THEME_ROLE_ON_SECONDARY]      = 0xECEFF4,
+        [THEME_ROLE_TERTIARY]          = 0x616E81,
+        [THEME_ROLE_ERROR]             = 0xBF616A,
+        [THEME_ROLE_OUTLINE]           = 0x4C566A,
+        [THEME_ROLE_OVERLAY]           = 0x242933,
+        [THEME_ROLE_SURFACE_TINT]      = 0x3F495C,
+        [THEME_ROLE_INVERSE_SURFACE]   = 0xECEFF4,
+        [THEME_ROLE_INVERSE_ON_SURFACE]= 0x2E3440,
+        [THEME_ROLE_SHADOW]            = 0x000000,
+        [THEME_ROLE_SCROLLBAR]         = 0x4C566A,
+        [THEME_ROLE_DISABLED]          = 0x5B667A,
+        [THEME_ROLE_BUTTON_BG]         = 0x3B4252,
+        [THEME_ROLE_BUTTON_TEXT]       = 0xECEFF4,
+        [THEME_ROLE_BUTTON_HOVER]      = 0x434C5E,
+        [THEME_ROLE_MENU_BG]           = 0x333B49,
+        [THEME_ROLE_MENU_ITEM_HOVER]   = 0x3F4859,
+        [THEME_ROLE_MENU_ITEM_SELECTED]= 0x465064,
+        [THEME_ROLE_WINDOW_BG]         = 0x3B4252,
+        [THEME_ROLE_WINDOW_TITLE]      = 0x333B49,
+        [THEME_ROLE_WINDOW_BORDER]     = 0x434C5E,
+        [THEME_ROLE_TASKBAR_BG]        = 0x272C36,
+        [THEME_ROLE_TASKBAR_TEXT]      = 0xD8DEE9,
+        [THEME_ROLE_ACCENT]            = 0xE5E9F0,
+    },
+    { .titlebar_h = 28, .corner_radius = 0, .btn_style = 0,
+      .title_grad_a = 0, .title_grad_b = 0, .winbtn_layout = 0,
+      .close_hover = 0xBF616A, .close_only = 0 },
+    1   /* platinum snow */
+};
+
 /* ── Theme table ─────────────────────────────────────────────────────── */
 static const theme_def_t* g_themes[THEME_COUNT] = {
     &THEME_VOID_DEF,
@@ -330,6 +374,7 @@ static const theme_def_t* g_themes[THEME_COUNT] = {
     &THEME_AURORA_DEF,
     &THEME_CRIMSON_DEF,
     &THEME_OBSIDIAN_DEF,
+    &THEME_MIST_DEF,
 };
 
 static theme_id_t g_active = THEME_VOID;
@@ -521,7 +566,7 @@ void theme_apply(theme_id_t id) {
 void theme_load_cfg(void) {
     load_user_themes_cfg();   /* user themes first: ids extend the built-ins */
     int fd = fs_open("cfg/theme.cfg", 0);
-    if (fd < 0) { g_active = THEME_VOID; return; }
+    if (fd < 0) { g_active = THEME_MIST; return; }   /* factory default */
     char b[16]; int n = fs_read(fd, b, 15); b[n < 15 ? n : 15] = 0;
     fs_close(fd);
     int v = 0;
@@ -530,7 +575,7 @@ void theme_load_cfg(void) {
         g_active = (theme_id_t)v;
         prefs.accent_color_idx = theme_def(g_active)->accent_idx;
     } else {
-        g_active = THEME_VOID;
+        g_active = THEME_MIST;
     }
     theme_reset_custom();
 }
@@ -640,5 +685,5 @@ void theme_init(void) {
     prefs.desktop_icons_mask = 0;
     memset(g_custom_colors, 0, sizeof(g_custom_colors));
     theme_load_accent_cfg();   /* restore persistent accent choice (cfg/accent.cfg) */
-    g_active = THEME_VOID;
+    g_active = THEME_MIST;     /* factory default: modern light grey */
 }

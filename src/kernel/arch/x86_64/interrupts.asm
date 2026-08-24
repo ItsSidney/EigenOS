@@ -173,8 +173,10 @@ ISR_NOERR 31
 ;   - rax = syscall number, rdi = arg1, rsi = arg2, rdx = arg3
 global syscall_handler_stub
 extern syscall_handler
+extern g_syscall_frame_rsp
 syscall_handler_stub:
     PUSH_ALL
+    mov [rel g_syscall_frame_rsp], rsp
     ; Stack after PUSH_ALL (low to high): r15, r14, r13, r12, rbp, rbx, r11,
     ; r10, r9, r8, rdi, rsi, rdx, rcx, rax  (so rax is at [rsp + 112]).
     ; int $0x80 ABI: rax=num, rdi=arg1, rsi=arg2, rdx=arg3, r8=arg4.

@@ -23,4 +23,10 @@ int atoi(const char* s);
 double atof(const char* s);
 void exit(int code);
 
+/* used by the kernel-side FreeType port */
+typedef int (*qsort_cmp)(const void*, const void*);
+void qsort(void* base, size_t nmemb, size_t size, qsort_cmp cmp);
+long strtol(const char* s, char** endp, int base);
+char* getenv(const char* name);
+
 #endif

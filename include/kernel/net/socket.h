@@ -55,6 +55,7 @@ int sys_connect(int s, const struct sockaddr* name, int namelen);
 int sys_send(int s, const void* msg, int len, int flags);
 int sys_recv(int s, void* buf, int len, int flags);
 int sys_socket_close(int s);
+int sys_socket_poll(int s);
 int sys_socket_closed(int s);
 int sys_socket_rx_total(int s);
 int sys_ping(uint32_t ip);

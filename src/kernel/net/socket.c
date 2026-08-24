@@ -356,6 +356,19 @@ int sys_recv(int s, void* buf, int len, int flags) {
     return to_copy;
 }
 
+/* Readiness bitmask for poll()/epoll: POLLIN when receive data is queued,
+ * POLLHUP once closed, POLLOUT while the connection is established.
+ * (Numeric values mirror include/kernel/syscall.h POLL_* defines.) */
+int sys_socket_poll(int s) {
+    if (s < 0 || s >= MAX_SOCKETS || sockets[s] == NULL) return -1;
+    struct socket* so = sockets[s];
+    int r = 0;
+    if (so->so_rcv_len > 0) r |= 0x001 | 0x040;   /* POLLIN | POLLRDNORM */
+    if (so->so_closed)      r |= 0x010;           /* POLLHUP */
+    if (so->so_state == TCPS_ESTABLISHED) r |= 0x004 | 0x100; /* POLLOUT | POLLWRNORM */
+    return r;
+}
+
 int sys_socket_rx_total(int s) {
     if (s < 0 || s >= MAX_SOCKETS || sockets[s] == NULL) return -1;
     return (int)sockets[s]->so_rcv_total;

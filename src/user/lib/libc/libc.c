@@ -24,6 +24,7 @@
 #include <locale.h>
 #include <wctype.h>
 #include <signal.h>
+#include <user/eigen.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <math.h>
@@ -213,15 +214,18 @@ char* setlocale(int category, const char* locale) {
 int system(const char* cmd) { (void)cmd; errno = ENOSYS; return -1; }
 
 sighandler_t signal(int signum, sighandler_t handler) {
-    (void)signum; (void)handler;
-    return SIG_DFL;
+    long prev = (long)eigen_syscall(EIGEN_SYS_SIGNAL,
+                                    (unsigned long)signum,
+                                    (unsigned long)(uintptr_t)handler, 0, 0);
+    return (prev == (long)-1) ? SIG_ERR : (sighandler_t)(uintptr_t)prev;
 }
 
 pid_t waitpid(pid_t pid, int* status, int options) {
-    (void)pid; (void)options;
-    if (status) *status = 0;
-    errno = ECHILD;
-    return -1;
+    long r = (long)eigen_syscall(EIGEN_SYS_WAIT4, (unsigned long)pid,
+                                 (unsigned long)(uintptr_t)status,
+                                 (unsigned long)options, 0);
+    if (r < 0) { errno = ECHILD; return -1; }
+    return (pid_t)r;
 }
 
 pid_t wait(int* status) { return waitpid(-1, status, 0); }
@@ -906,3 +910,8 @@ double atof(const char* s) {
     if (*s=='.'){ s++; while(*s>='0'&&*s<='9'){ frac=frac*10+(*s-'0'); scale*=10; s++; } v+=frac/scale; }
     return neg?-v:v;
 }
+
+/* fscanf stub — nothing in EigenOS feeds scanf-style input; callers that
+ * parse optional system files (fontconfig) just get EOF. */
+#include <stdarg.h>
+int fscanf(void *f, const char *fmt, ...) { (void)f; (void)fmt; return -1; }

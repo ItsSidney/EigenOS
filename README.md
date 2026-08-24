@@ -155,23 +155,11 @@ Each one has a matching test program that prints `[NAME] ALL PASS`:
 | zlib           | 1.3.1    | Z_SOLO, custom allocator                          |
 | libpng         | 1.6.43   | SIMD off, software-only                           |
 | libjpeg (IJG)  | 9e       | jmemnobs backend, encode+decode verified          |
-| Eina           | 1.26     | POSIX bits replaced with kernel/VFS equivalents   |
-| Eo             | 1.26     | object system, recursive mutex support            |
-| Emile          | 1.26     | zlib backend only, LZ4 dropped                    |
-| Eet            | 1.26     | container I/O rewritten over the ramfs syscall API |
-| Ecore          | —        | behavior-compatible rewrite, see note             |
-
-The Ecore note: upstream Ecore 1.26 doesn't contain a loop anymore — it wraps
-the Efl interface layer (`Efl.Loop`, `Efl.App`, ...), and generating those
-classes requires eolian codegen that this environment can't run. So
-`src/user/lib/ecore/` implements the classic Ecore semantics directly:
-main loop, timers, idlers, animators, pollers, jobs, idle enterers/exiters.
-Same API shape, same callback contracts, none of the object system. It's the
-honest version of "port Ecore" given the constraints, and `ecoretest`
-drives all of it until a timer quits the loop.
-
-Not ported yet: the Efl interfaces themselves, Evas, Ecore_Evas, Edje,
-Elementary. That's the road to running real EFL applications, and it's long.
+EFL (Eina, Eo, Emile, Eet, Ecore, Evas, Edje, Elementary) was previously
+ported here as the ring-3 GUI toolkit and has since been removed entirely.
+The OS now uses its own native compositing desktop under `src/gui/`
+(framebuffer + GFX/GPU drivers, Freetype text, input stack); see
+`src/gui/wm.c` and `src/drivers/video/`. No EFL code remains in the tree.
 
 ---
 
@@ -185,8 +173,8 @@ TinyGL demos including glgears, imgui playground, FreeType glyph viewer,
 and DOOM.
 
 Terminal utilities: `awk` (the one true awk, ported), `kilo`, plus the test
-suite — `posixtest ftglyph pthreadtest setjmptest polltest eintest eotest
-zlibtest eettest pngtest jpegtest ecoretest`. After any library work, run the
+ suite — `posixtest ftglyph pthreadtest setjmptest polltest
+zlibtest pngtest jpegtest`. After any library work, run the
 matching test in the VM. If it ends in ALL PASS, ship it.
 
 Small ritual worth knowing: `imgview` generates `/demo.png` and `/demo.jpg`

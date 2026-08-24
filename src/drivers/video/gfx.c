@@ -65,6 +65,13 @@ void gfx_pop_clip(void) {
     }
 }
 
+void gfx_get_clip(int* x0, int* y0, int* x1, int* y1) {
+    if (x0) *x0 = clip_x0;
+    if (y0) *y0 = clip_y0;
+    if (x1) *x1 = clip_x1;
+    if (y1) *y1 = clip_y1;
+}
+
 // ── Utility ─────────────────────────────────────────────────
 
 static int64_t gfx_isqrt64(int64_t n) {

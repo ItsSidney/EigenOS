@@ -83,13 +83,13 @@ typedef struct {
     uint64_t size;
 } user_module_t;
 
-static user_module_t user_modules[64];
+static user_module_t user_modules[192];
 static int user_module_count = 0;
 
 extern uint64_t hhdm_offset;
 
 static void register_user_module(struct limine_file* f) {
-    if (user_module_count >= 64) return;
+    if (user_module_count >= 160) return;
     const char* p = f->path;
     const char* slash = 0;
     for (const char* q = p; q && *q; q++) if (*q == '/') slash = q;
@@ -132,6 +132,20 @@ int user_module_find(const char* name, const void** data, uint64_t* size) {
         }
     }
     return -1;
+}
+
+/* Enumeration API: lets subsystems (e.g. the wallpaper manager) walk
+   every registered Limine module without knowing names up front. */
+int user_module_total(void) {
+    return user_module_count;
+}
+
+int user_module_at(int idx, const char** name, const void** data, uint64_t* size) {
+    if (idx < 0 || idx >= user_module_count) return -1;
+    if (name) *name = user_modules[idx].name;
+    if (data) *data = user_modules[idx].addr;
+    if (size) *size = user_modules[idx].size;
+    return 0;
 }
 
 __attribute__((used, section(".requests")))
@@ -180,6 +194,12 @@ volatile struct limine_memmap_request memmap_request = {
     .revision = 0
 };
 
+__attribute__((used, section(".requests")))
+static volatile struct limine_smp_request smp_request = {
+    .id = LIMINE_SMP_REQUEST,
+    .revision = 0,
+    .response = 0
+};
 __attribute__((used, section(".requests")))
 volatile struct limine_rsdp_request rsdp_request = {
     .id = LIMINE_RSDP_REQUEST,
@@ -342,6 +362,13 @@ void _start_c(void) {
     hcf();
 }
 
+/* APs land here and sleep forever until real SMP support exists. */
+static void ap_park(struct limine_smp_info* info) {
+    (void)info;
+    __asm__ volatile("cli");
+    for (;;) __asm__ volatile("hlt");
+}
+
 void kmain() {
     draw_early_progress(8, 0x00FF00); // kmain
 
@@ -351,6 +378,21 @@ void kmain() {
     
     log_init();
     klog("[EIGEN] Kernel log started\n");
+
+    /* ── SMP: park application processors deterministically ──
+     * Limine holds APs until we write goto_address. Point them at a
+     * cli/hlt loop so they can never race early init (the cause of
+     * doubled init lines + multi-minute KVM boots on -smp >= 2). */
+    if (smp_request.response) {
+        for (uint64_t i = 0; i < smp_request.response->cpu_count; i++) {
+            struct limine_smp_info* cpu = smp_request.response->cpus[i];
+            if (cpu->lapic_id == smp_request.response->bsp_lapic_id) continue;
+            cpu->goto_address = ap_park;
+            serial_puts("[SMP] parked ap lapic=");
+            {   char b[24]; itoa((uint64_t)cpu->lapic_id, b); serial_puts(b); }
+            serial_puts("\n");
+        }
+    }
 
     vmm_init();
     {
@@ -383,16 +425,27 @@ void kmain() {
     boot_log_add("AUDIO", "Master sound pipeline initialized", 0xBC8CFF, 0xE8EAED);
     draw_early_progress(15, 0x00FF00); // Audio
 
-    init_filesystem();
-    boot_log_add("VFS", "Virtual Filesystem mounted", 0x39D2C0, 0x3FB950);
-    draw_early_progress(16, 0x00FF00); // Filesystem
-
     pci_init();
+    {
+        extern void virtio_blk_init(void);
+        virtio_blk_init();
+    }
     boot_log_add("PCI", "PCI Express & Legacy bus scan complete", 0x38BDF8, 0x3FB950);
     draw_early_progress(17, 0x00FF00); // PCI
 
-    dac_late_init();   /* probe for a real AC97/HD Audio DAC now that PCI is scanned */
+    /* Block devices (virtio-blk) ready — now seed/restore filesystem. */
+    ide_init();
+    draw_early_progress(23, 0x00FF00); // IDE
 
+    init_filesystem();
+    serial_puts("[KM] init_fs returned\n");
+    boot_log_add("VFS", "Virtual Filesystem mounted", 0x39D2C0, 0x3FB950);
+    serial_puts("[KM] vfs logged\n");
+
+    dac_late_init();
+    serial_puts("[BOOT] post-dac\n");   /* probe for a real AC97/HD Audio DAC now that PCI is scanned */
+
+    serial_puts("[BOOT] pre-acpi\n");
     if (acpi_init() == 0) {
         boot_log_add_hex("ACPI", "ACPI RSDP table located at", 0x58A6FF, 0xE8EAED, (uint64_t)rsdp_request.response->address, 0x3FB950);
         draw_early_progress(18, 0x00FF00); // ACPI
@@ -402,34 +455,42 @@ void kmain() {
     }
     
     gpu_init();
+    serial_puts("[BOOT] post-gpu\n");
     boot_log_add("GPU", "Graphics hardware acceleration initialized", 0x58A6FF, 0x3FB950);
     draw_early_progress(19, 0x00FF00); // GPU
 
+    extern void pty_init(void);
+    pty_init();
+
     __asm__ volatile("sti");
+    serial_puts("[BOOT] post-sti\n");
 
     net_init();
+    serial_puts("[BOOT] post-net\n");
     g_diag_phase = "net";
     boot_log_add("NET", "TCP/IP stack & Ethernet ready", 0x38BDF8, 0x3FB950);
     draw_early_progress(20, 0x00FF00); // Network
 
     /* Verify the WolfSSL TLS port loads its CA bundle + RNG at runtime. */
     extern int tls_selftest(void);
-    if (tls_selftest())
+    serial_puts("[BOOT] pre-tls\n");
+    int tls_ok = tls_selftest();
+    serial_puts("[BOOT] post-tls\n");
+    if (tls_ok)
         boot_log_add("TLS", "WolfSSL self-test OK (CAs+RNG loaded)", 0x52C536, 0x3FB950);
     else
         boot_log_add("TLS", "WolfSSL self-test FAILED", 0xF44336, 0x3FB950);
     
     init_mouse();
+    serial_puts("[BOOT] post-mouse\n");
     mouse_set_bounds(get_fb_width(), get_fb_height());
     boot_log_add("INPUT", "PS/2 + USB Human Interface Device driver ready", 0x58A6FF, 0x3FB950);
     draw_early_progress(21, 0x00FF00); // Mouse
     
     vfs_init();
+    serial_puts("[BOOT] post-vfs.init\n");
     draw_early_progress(22, 0x00FF00); // VFS
     
-    ide_init();
-    boot_log_add_hex("ATA", "Primary IDE controller base", 0x58A6FF, 0xE8EAED, (uint64_t)0x1F0, 0x3FB950);
-    draw_early_progress(23, 0x00FF00); // IDE
     
     serial_puts("[KERNEL] mounting ramfs...\n");
     vfs_mount("/", ramfs_init());
@@ -446,6 +507,7 @@ void kmain() {
             boot_log_add("FAT32", "Partition mounted successfully", 0x3FB950, 0x3FB950);
         }
     }
+    serial_puts("[BOOT] pre-worker\n");
     serial_puts("[KERNEL] creating background worker...\n");
     g_diag_phase = "worker";
     create_task(background_worker, "Worker");
@@ -462,8 +524,6 @@ void kmain() {
     swap_buffers();
 
     serial_puts("[KERNEL] Starting GUI...\n");
-    extern void api81_demo(void);
-    api81_demo();
     start_gui();    // Boot to GUI
 
     while(1) {

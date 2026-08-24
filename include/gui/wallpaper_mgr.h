@@ -76,6 +76,6 @@ void wallpaper_mgr_draw_region(const void* img /* bmp_image_t* */,
 /* Blit the active file wallpaper, COVER-fit (fills the area, crops overflow)
  * into a 32-bit RGBA buffer (e.g. the framebuffer) of cw x ch using the given
  * row stride. Used by the wallpaper pipeline. */
-void wallpaper_mgr_blit_active(uint32_t* dst, int stride, int cw, int ch);
+int  wallpaper_mgr_blit_active(uint32_t* dst, int stride, int cw, int ch);
 
 #endif

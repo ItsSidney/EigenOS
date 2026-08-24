@@ -15,6 +15,7 @@ extern FILE _eigen_stderr;
 #define stdout (&_eigen_stdout)
 #define stderr (&_eigen_stderr)
 
+int  fscanf(void *f, const char* fmt, ...);
 int  printf(const char* fmt, ...);
 int  fprintf(FILE* stream, const char* fmt, ...);
 int  vprintf(const char* fmt, va_list ap);

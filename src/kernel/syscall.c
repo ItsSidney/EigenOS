@@ -22,6 +22,7 @@
 #include "drivers/video/framebuffer.h"
 #include "drivers/video/gfx.h"
 #include "drivers/input/keyboard.h"
+#include "drivers/input/mouse.h"
 #include "drivers/audio/speaker.h"
 #include "filesystem/filesystem.h"
 #include "filesystem/vfs.h"
@@ -54,7 +55,7 @@ extern int create_user_process_elf(const char* name);
 /* leaking them.                                                       */
 /* ------------------------------------------------------------------ */
 #define USER_HEAP_BASE  0x20000000ULL
-#define USER_HEAP_LIMIT (USER_HEAP_BASE + 64ULL * 1024 * 1024)
+#define USER_HEAP_LIMIT (USER_HEAP_BASE + 256ULL * 1024 * 1024)
 
 typedef struct user_blk {
     uint64_t base;          /* user virtual address of the block        */
@@ -130,7 +131,15 @@ static uint64_t k_sys_alloc_user(uint64_t size) {
                 user_blk_new(b->base + npages * 4096, b->npages - npages, 1);
                 b->npages = npages;
             }
+            /* Reused blocks were mapped into whichever task allocated them
+             * originally. A freshly spawned task has its own address space,
+             * so (re)map into the caller before handing the VA out — fresh
+             * physical frames, no cross-task aliasing. */
             b->free = 0;
+            if (user_map_pages(b->base, b->npages) != 0) {
+                b->free = 1;            /* hand back rather than return garbage */
+                return -1;
+            }
             return b->base;
         }
     }
@@ -152,6 +161,16 @@ static void k_sys_free_user(uint64_t ptr) {
         if (b->base == ptr) {
             if (b->free) return;            /* double free — ignore */
             b->free = 1;
+            /* Return the backing pages to the PMM and drop the mappings.
+               Without this, every free/realloc cycle burned fresh frames:
+               ImGui churns MBs per frame, so a long-lived C++ app drained
+               physical RAM until pmm_alloc failed and malloc handed -1. */
+            for (uint64_t p = 0; p < b->npages; p++) {
+                uint64_t va = b->base + p * 4096;
+                uint64_t phys = vmm_get_phys(va);
+                vmm_unmap(va);
+                if (phys) pmm_free(phys);
+            }
             user_blk_coalesce(b);
             return;
         }
@@ -176,9 +195,19 @@ static uint64_t k_sys_exit(uint64_t code, uint64_t a2, uint64_t a3, uint64_t a4)
 
 static uint64_t k_sys_write(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a4) {
     (void)a4;
-    if (fd == 1 || fd == 2) {
-        // Route stdout/stderr to the active GUI terminal when present
-        // (visible where you typed `spawn`), else the kernel log.
+    /* Kernel-object fds (pipe/pty/socket) MUST dispatch to sys_write first —
+       a child's inherited pty stdout is fd 1 and must land in the pty ring,
+       not the console. Console fallback only for bare descriptors. */
+    task_t* cur = get_current_task();
+    if (cur && (cur->fd_types[fd] == FD_PIPE ||
+                cur->fd_types[fd] == FD_PTY ||
+                cur->fd_types[fd] == FD_SOCKET)) {
+        return (uint64_t)sys_write((int)fd, (const char*)buf, (uint32_t)count);
+    }
+    if ((fd == 1 || fd == 2) &&
+        (!cur || (cur->fd_types[fd] != FD_PIPE &&
+                  cur->fd_types[fd] != FD_PTY &&
+                  cur->fd_types[fd] != FD_SOCKET))) {
         if (count > 255) count = 255;
         char tmp[256];
         memcpy(tmp, (const char*)buf, (size_t)count);
@@ -189,7 +218,7 @@ static uint64_t k_sys_write(uint64_t fd, uint64_t buf, uint64_t count, uint64_t 
         serial_puts(tmp);
         return count;
     }
-    return (uint64_t)sys_write((int)fd, (char*)buf, (uint32_t)count);
+    return (uint64_t)sys_write((int)fd, (const char*)buf, (uint32_t)count);
 }
 
 static uint64_t k_sys_read(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a4) {
@@ -318,12 +347,23 @@ static uint64_t k_sys_gfx(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
     }
 }
 
+static int user_ptr_ok(uint64_t p);
+
 static uint64_t k_sys_input(uint64_t op, uint64_t a2, uint64_t a3, uint64_t a4) {
-    (void)a2; (void)a3; (void)a4;
     switch (op) {
         case EIGEN_INPUT_KBHIT:   return (uint64_t)keyboard_has_input();
         case EIGEN_INPUT_GETCHAR: return (uint64_t)(unsigned char)get_key();
         case EIGEN_INPUT_DRAIN:   keyboard_drain(); return 0;
+        case EIGEN_INPUT_MOUSE_DELTA: {
+            /* a2 = int* dx, a3 = int* dy, a4 = int* buttons */
+            int dx = 0, dy = 0;
+            mouse_get_deltas(&dx, &dy);
+            int btn = mouse_get_buttons();
+            if (a2 && user_ptr_ok(a2)) *(int*)a2 = dx;
+            if (a3 && user_ptr_ok(a3)) *(int*)a3 = dy;
+            if (a4 && user_ptr_ok(a4)) *(int*)a4 = btn;
+            return 0;
+        }
         default: return EIGEN_ERR_INVAL;
     }
 }
@@ -338,6 +378,92 @@ static uint64_t k_sys_beep(uint64_t freq, uint64_t ms, uint64_t a3, uint64_t a4)
 }
 
 /* ------------------------------------------------------------------ */
+/* ── Signals (SYS_SIGNAL / SYS_KILL / SYS_SIGRETURN) ─────────────── */
+volatile uint64_t g_syscall_frame_rsp = 0;   /* set by int80 stub */
+
+static uint64_t k_sys_signal(uint64_t sig, uint64_t handler,
+                             uint64_t a3, uint64_t a4) {
+    (void)a3; (void)a4;
+    task_t* t = get_current_task();
+    if (!t || sig <= 0 || sig >= 32) return (uint64_t)-1;
+    void* old = t->sig_handlers[sig];
+    if ((uint64_t)handler == 2 /* SIG_ERR-ish */) return (uint64_t)old;
+    t->sig_handlers[sig] = (void*)handler;
+    return (uint64_t)old;
+}
+
+static uint64_t k_sys_kill(uint64_t pid, uint64_t sig,
+                           uint64_t a3, uint64_t a4) {
+    (void)a3; (void)a4;
+    extern int send_signal(int pid, int sig);
+    return (uint64_t)send_signal((int)pid, (int)sig);
+}
+
+static uint64_t k_sys_openpty(uint64_t fds_u, uint64_t a2, uint64_t a3, uint64_t a4) {
+    (void)a2; (void)a3; (void)a4;
+    extern int sys_openpty(int fds[2]);
+    return (uint64_t)sys_openpty((int*)fds_u);
+}
+
+
+static uint64_t k_sys_fork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    (void)a1;(void)a2;(void)a3;(void)a4;
+    extern long sys_fork(void);
+    return (uint64_t)sys_fork();
+}
+static uint64_t k_sys_execve(uint64_t path, uint64_t argv, uint64_t envp, uint64_t a4) {
+    (void)a4;
+    extern long sys_execve(const char*, char* const[], char* const[]);
+    return (uint64_t)sys_execve((const char*)path, (char* const*)argv, (char* const*)envp);
+}
+static uint64_t k_sys_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t a4) {
+    (void)a4;
+    extern long sys_wait4(int, int*, int);
+    return (uint64_t)sys_wait4((int)pid, (int*)status, (int)options);
+}
+static uint64_t k_sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t a4) {
+    (void)a4;
+    extern long sys_getdents64(int, void*, unsigned int);
+    return (uint64_t)sys_getdents64((int)fd, (void*)buf, (unsigned int)count);
+}
+static uint64_t k_sys_readv(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4) {
+    (void)a4;
+    extern long sys_readv(int, const void*, int);
+    return (uint64_t)sys_readv((int)fd, (const void*)iov, (int)cnt);
+}
+static uint64_t k_sys_writev(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4) {
+    (void)a4;
+    extern long sys_writev(int, const void*, int);
+    return (uint64_t)sys_writev((int)fd, (const void*)iov, (int)cnt);
+}
+static uint64_t k_sys_dup2(uint64_t oldf, uint64_t newf, uint64_t a3, uint64_t a4) {
+    (void)a3;(void)a4;
+    extern long sys_dup2(int, int);
+    return (uint64_t)sys_dup2((int)oldf, (int)newf);
+}
+static uint64_t k_sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a3, uint64_t a4) {
+    (void)a3;(void)a4;
+    extern long sys_arch_prctl(long, uint64_t);
+    return (uint64_t)sys_arch_prctl((long)code, addr);
+}
+static uint64_t k_sys_set_tid_address(uint64_t tidptr, uint64_t a2, uint64_t a3, uint64_t a4) {
+    (void)a2;(void)a3;(void)a4;
+    extern long sys_set_tid_address(uint64_t);
+    return (uint64_t)sys_set_tid_address(tidptr);
+}
+
+static uint64_t k_sys_sigreturn(uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4) {
+    (void)a1; (void)a2; (void)a3; (void)a4;
+    task_t* t = get_current_task();
+    if (!t || !t->sig_in_handler) return (uint64_t)-1;
+    registers_t* fr = (registers_t*)g_syscall_frame_rsp;
+    if (!fr) return (uint64_t)-1;
+    *fr = t->sig_save;
+    t->sig_in_handler = 0;
+    return t->sig_save.rax;
+}
+
 /* Ring-3 windows (EIGEN_SYS_WIN)                                      */
 /* ------------------------------------------------------------------ */
 #define FONT_MAP_VMA 0x7C000000ULL
@@ -476,8 +602,11 @@ static uint64_t k_sys_modload(uint64_t name, uint64_t dest, uint64_t maxbytes, u
 
     const void* mdata = 0;
     uint64_t msize = 0;
-    if (user_module_find((const char*)name, &mdata, &msize) != 0 || !mdata || msize == 0)
+    if (user_module_find((const char*)name, &mdata, &msize) != 0 || !mdata || msize == 0) {
+        extern void serial_puts(const char*);
+        serial_puts("[MODLOAD] miss: "); serial_puts((const char*)name); serial_puts("\n");
         return EIGEN_ERR_NOENT;
+    }
 
     uint64_t copy = msize < maxbytes ? msize : maxbytes;
     extern void serial_puts(const char* s);
@@ -498,10 +627,24 @@ static int user_ptr_ok(uint64_t p) {
 }
 
 static uint64_t k_sys_fs(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
+    /* mutating ops pre-mark the tree dirty (over-marking is harmless:
+       autosave of an unchanged tree is a cheap no-op diff) */
+    switch (op) {
+    case EIGEN_FS_MKDIR: case EIGEN_FS_CREATE: case EIGEN_FS_DELETE:
+    case EIGEN_FS_RMDIR: case EIGEN_FS_RENAME: case EIGEN_FS_TRUNCATE: {
+        extern void persist_mark_dirty(void);
+        persist_mark_dirty();
+        break;
+    }
+    }
+
     switch (op) {
     case EIGEN_FS_MKDIR:
+        /* fs_mkdir returns a slot index on success — normalize to 0 like
+         * FS_CREATE does, or callers read success as failure */
         if (!user_ptr_ok(a)) return EIGEN_ERR_INVAL;
-        return (uint64_t)(int)fs_mkdir((const char*)a);
+        if (fs_mkdir((const char*)a) < 0) return EIGEN_ERR_INVAL;
+        return 0;
     case EIGEN_FS_CREATE: {
         if (!user_ptr_ok(a)) return EIGEN_ERR_INVAL;
         int fd = fs_create((const char*)a);
@@ -724,8 +867,16 @@ extern void net_poll(void);
 
 static uint64_t k_sys_net(uint64_t op, uint64_t a, uint64_t b, uint64_t c) {
     switch (op) {
-    case EIGEN_NET_SOCKET:
-        return (uint64_t)(int64_t)sys_socket((int)a, (int)b, (int)c);
+    case EIGEN_NET_SOCKET: {
+        int sock = (int)sys_socket((int)a, (int)b, (int)c);
+        /* tag the fd so poll/epoll can route readiness checks to the
+         * socket table instead of the file table */
+        if (sock >= 0 && sock < MAX_FDS) {
+            task_t* cur = get_current_task();
+            if (cur) cur->fd_types[sock] = FD_SOCKET;
+        }
+        return (uint64_t)(int64_t)sock;
+    }
     case EIGEN_NET_CONNECT: {
         /* a = sock, b = uint32_t ip (network byte order), c = uint16_t port */
         struct sockaddr_in addr;
@@ -857,6 +1008,12 @@ extern struct pipe_buf pipes[MAX_PIPES];
 static int fd_poll_revents(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return POLLNVAL;
     task_t* cur = get_current_task();
+    if (cur->fd_types[fd] == FD_SOCKET) {
+        extern int sys_socket_poll(int s);
+        int r = sys_socket_poll(fd);
+        if (r < 0) return POLLNVAL;
+        return r;
+    }
     if (cur->fd_types[fd] == FD_PIPE) {
         struct pipe_buf* p = &pipes[cur->fd_pipe[fd]];
         int r = 0;
@@ -865,6 +1022,10 @@ static int fd_poll_revents(int fd) {
         if (avail < (PIPE_BUF_SIZE - 1)) r |= POLLOUT | POLLWRNORM;
         if (p->writer_count == 0) r |= POLLHUP;   /* writer closed: reader sees EOF */
         return r;
+    }
+    if (cur->fd_types[fd] == FD_PTY) {
+        extern int pty_poll(int, int);
+        return pty_poll(cur->fd_pty[fd], cur->fd_flags_extra[fd] & 1);
     }
     if (fd == 1 || fd == 2) return POLLOUT | POLLWRNORM;
     if (cur->fd_flags[fd] > 0 || cur->fds[fd]) return POLLIN | POLLRDNORM | POLLOUT | POLLWRNORM;
@@ -895,9 +1056,11 @@ static uint64_t k_sys_poll(uint64_t fds_u, uint64_t nfds_u, uint64_t timeout_u, 
             if (fd < 0) { local[i].revents = 0; continue; }
             int r = fd_poll_revents(fd);
             if (r == POLLNVAL) { local[i].revents = (short)POLLNVAL; ready++; continue; }
-            r &= local[i].events;
-            local[i].revents = r ? (short)r : 0;
-            if (r) ready++;
+            /* POSIX: POLLERR/POLLHUP are reported regardless of requested
+             * events — masking them strands waiters on remote close. */
+            int reported = (r & local[i].events) | (r & (POLLERR | POLLHUP));
+            local[i].revents = reported ? (short)reported : 0;
+            if (reported) ready++;
         }
         if (ready || timeout_ms == 0) break;
         if (deadline < 0) {
@@ -1034,6 +1197,45 @@ static uint64_t k_sys_pipe(uint64_t pipefd_u, uint64_t a2, uint64_t a3, uint64_t
     return 0;
 }
 
+/* Spawn with fd inheritance: b points at int[3] in the caller's space —
+   {stdin, stdout, stderr}, each either -1 (closed) or a PARENT fd (pipe end
+   or file) the child should receive as its own slot 0/1/2. */
+extern int create_user_process_elf_redir(const char* name, int argc, char* const argv[],
+                                          const int parent_redir[3]);
+static uint64_t k_sys_spawn_fds(uint64_t name, uint64_t redir_u, uint64_t argv_u, uint64_t argc) {
+    if (!name || !user_ptr_ok(name)) return EIGEN_ERR_INVAL;
+    int redir[3] = { -1, -1, -1 };
+    if (redir_u) {
+        if (!user_ptr_ok(redir_u)) return EIGEN_ERR_INVAL;
+        const volatile int* up = (const volatile int*)(uintptr_t)redir_u;
+        for (int i = 0; i < 3; i++) redir[i] = up[i];
+        for (int i = 0; i < 3; i++)
+            if (redir[i] >= MAX_FDS) return EIGEN_ERR_INVAL;
+    }
+    /* argv copy mirrors k_sys_spawn */
+    if (argc > 0) {
+        if (!argv_u || argv_u >= 0x800000000000ULL) return EIGEN_ERR_INVAL;
+        if (argc > MAX_ARGS) argc = MAX_ARGS;
+        uint64_t* uargv = (uint64_t*)(uintptr_t)argv_u;
+        char* kargv[MAX_ARGS] = {0};
+        int n = 0;
+        for (; n < argc; n++) {
+            uint64_t p = uargv[n];
+            if (!p || p >= 0x800000000000ULL) break;
+            size_t len = 0;
+            while (((char*)(uintptr_t)p)[len] && len < 1023) len++;
+            char* k = (char*)kmalloc(len + 1);
+            if (!k) break;
+            for (size_t j = 0; j <= len; j++) k[j] = ((char*)(uintptr_t)p)[j];
+            kargv[n] = k;
+        }
+        uint64_t rc = (uint64_t)create_user_process_elf_redir((const char*)name, n, kargv, redir);
+        for (int i = 0; i < n; i++) kfree(kargv[i]);
+        return rc;
+    }
+    return (uint64_t)create_user_process_elf_redir((const char*)name, 0, 0, redir);
+}
+
 static uint64_t k_sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4) {
     (void)a4;
     int r = sys_fcntl((int)fd, (int)cmd, (int)arg);
@@ -1072,7 +1274,21 @@ static syscall_fn syscall_table[SYSCALL_COUNT] = {
     k_sys_poll,         // 27
     k_sys_epoll,        // 28
     k_sys_pipe,         // 29
-    k_sys_fcntl         // 30
+    k_sys_fcntl,        // 30
+    k_sys_spawn_fds,    // 31
+    k_sys_signal,       // 32
+    k_sys_kill,         // 33
+    k_sys_sigreturn,    // 34
+    k_sys_openpty,      // 35
+    k_sys_fork,         // 36
+    k_sys_execve,       // 37
+    k_sys_wait4,        // 38
+    k_sys_getdents64,   // 39
+    k_sys_readv,        // 40
+    k_sys_writev,       // 41
+    k_sys_dup2,         // 42
+    k_sys_arch_prctl,   // 43
+    k_sys_set_tid_address // 44
 };
 
 uint64_t syscall_handler(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4) {
@@ -1081,3 +1297,12 @@ uint64_t syscall_handler(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t ar
     if (!fn) return -1;
     return fn(arg1, arg2, arg3, arg4);
 }
+
+int klog_console_write(const char* s, int n) {
+    if (!s) return -1;
+    extern void serial_puts(const char*);
+    char tmp[2] = {0,0};
+    for (int i = 0; i < n; i++) { tmp[0] = s[i]; serial_puts(tmp); }
+    return n;
+}
+

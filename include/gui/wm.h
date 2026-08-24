@@ -16,7 +16,7 @@
 #include <stdint.h>
 
 #define WM_MAX_WINDOWS 8
-#define WM_TITLEBAR_H  32
+#define WM_TITLEBAR_H  24
 #define WM_TASKBAR_H   36
 #define WM_MIN_W       200
 #define WM_MIN_H       120

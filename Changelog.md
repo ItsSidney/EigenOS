@@ -3,6 +3,169 @@
 All notable changes to **EigenOS** (formerly BEDI_OS), a bare-metal x86-64
 GUI operating system. Written by Sidney.
 
+## 2026 — musl libc port (IN PROGRESS — libmusl.a builds & links hello-world)
+- tools/build-musl.sh compiles musl 1.2.5 freestanding into **bin/obj/user/libmusl.a**
+  (787 objects, ~738 KB). All objects are collapsed into one relocatable module with
+  `ld -r --allow-multiple-definition` (musl's internal symbols are `hidden` and only
+  resolve inside a single module), then wrapped in an archive.
+- arch/eigen/ syscall bridge: int $0x80 → EIGEN_SYS_*; unsupported syscalls short-circuit
+  to -ENOSYS; SYS_brk bridged locally via __eigen_brk over a 16 MB ALLOC region.
+- mmap/munmap/mremap/madvise/mprotect backed by EIGEN_SYS_ALLOC(7)/FREE(8).
+- Single-threaded/UTC stubs for threads, posix_spawn, signals, strerror, strsignal, tz.
+- Verified: hello-world using write/malloc/strlen/free AND printf/malloc/free link
+  cleanly against libmusl.a (ld exits 0). Steps 1-7 of the port plan complete.
+- Remaining: relink NetSurf (step 8) and other apps (step 9) off the hand-written libc
+  and onto libmusl.a; optional real threads/signals/locale.
+
+## 2026 — NetSurf 3.11 port (IN PROGRESS — core fully compiling)
+- Vendored netsurf-all-3.11 under libs/netsurf (RISC-OS-only libs dropped).
+- tools/build-netsurf.sh batch compiler: ALL browser libraries + the full
+  core now compile freestanding against our libc — ~470 TUs, zero failures:
+  wapcaplet, parserutils, utf8proc, nslog, nspsl, nsutils, nsbmp, nsgif,
+  libhubbub 31/31 (HTML5 tokenizer; entities.inc + gperf element-type
+  regenerated in-tree), libdom 94/94, libcss 184/184, utils+desktop,
+  content/file/about/data fetchers, css/image/text/html handlers.
+- libs/netsurf/shim/: native-first support layer — iconv (UTF8/UTF16/
+  Latin1), regex stubs (regcomp fails → save_complete degrades), scandir,
+  strtof/strtoll/strtoull/strspn/strcspn, inet_pton(v4), minimal
+  sys/socket+netinet+arpa headers, endian.h, dirfd/fstatat/unlinkat via
+  path-tracking wrappers (ramfs has no real dirfds).
+- Native choices per direction: FreeType fonts via existing ring-3 port,
+  file:// fetcher over the VFS, presentation = direct eigen window blit.
+- libnsfb DONE (12 objs): core/cursor/palette/api/util/generic, all
+  enabled format plotters (8/16/32-xrgb/32-xbgr; 1+24bpp upstream-gated),
+  surface/ram.c = malloc surface our app blits to the eigen window.
+- Framebuffer frontend DONE (11 objs): gui/framebuffer/font_freetype/
+  browser plumbing; -Dnsframebuffer selects fb options; NETSURF_FB_FONT_*
+  defines point at DejaVu under /home/user/netsurf/res/fonts.
+- REMAINING: app entry main.c (init→window→loop→blit), welcome.html,
+  build.sh link target. ~470 TUs total, zero failures.
+- NOTE: stray 'build.sh run' wrappers were wiping bin/obj/user mid-build
+  (phantom missing-dir errors). Kill them before building.
+
+## 2026 — Spawn fd redirection (pipes between processes)
+- NEW SYSCALL EIGEN_SYS_SPAWN_FDS (31): spawn a ring-3 ELF with fd
+  inheritance — b points at int32[3]{stdin,stdout,stderr} naming PARENT
+  fds (-1 = closed). Kernel snapshots parent fd metadata while its pml4
+  is still active (create_user_process_elf_redir in task.c), installs
+  child slots 0..2 after task creation: pipe fds share the refcounted
+  pipes[] ring (reader/writer counts bumped, EOF semantics intact),
+  file fds share the fs index with copied offset. Existing spawn ABI
+  unchanged (wrapper passes {-1,-1,-1}).
+- userlib: eigen_spawn_fds(name, argc, argv, fds[3]).
+- TERMINAL: new `run <app> [args...]` — creates a pipe, spawns <app>
+  with stdout->pipe, drains until EOF (blocking reads), reaps via
+  eigen_wait, prints output lines + exit code. First text-hosted
+  programs on EigenOS; foundation for pipelines + a real shell.
+- TEST APP: test/hello (folder app, auto-registered) writes to inherited
+  stdout and echoes argv; `run hello` demonstrates end-to-end.
+
+## 2026 — Terminal spawn fixes + per-entry module registration
+(An experimental Lite XL 2.1.7 port lived here briefly and was removed;
+the infrastructure it drove is kept below.)
+- LITE XL 2.1.7 PORTED: the Lua-based code editor now builds as a ring-3
+  ELF (`litexl`, ~2 MB, zero unresolved symbols) via a dedicated
+  `build_litexl()` in build.sh (DOOM-style, x87 enabled for Lua doubles).
+  - LUA 5.4.4 vendored at `libs/lua54` alongside the EFL stack's 5.1:
+    all 33 TUs compile freestanding with `tools/build-lua54.sh`; shim
+    covers strspn/strcoll/strxfrm/ldexp/localeconv/clock/tmpfile/tmpnam/
+    difftime/setvbuf + sig_atomic_t; loslib+loadlib INCLUDED (UTC-only
+    time/gmtime/mktime/strftime from RTC, graceful dlopen-less require)
+    so os.time/os.date/require work.
+  - SDL2 REPLACED by `eigen_sdl.c/h`: surfaces (AARRGGBB + real pixel
+    format records incl. 8bpp glyph atlases), FillRect, alpha-blending
+    BlitScaled (lite's translucent rects), clip rects, RWops over VFS,
+    event queue fed from eigen_win_poll — key events carry WM-packed
+    Shift/Ctrl/Alt mods (see below), TEXTINPUT synthesized for printables,
+    resize events synthesized when the WM resizes content buffers.
+    renwindow uses the LITE_USE_SDL_RENDERER surface path; present =
+    dirty-rect copy into the eigen window buffer + flush.
+  - api/process.c + api/regex.c are graceful stubs (metatable __index →
+    error); dirmonitor uses the upstream dummy backend.
+  - data/resources (78 lua/font files) packed into a generated C blob
+    (litexl_data.c) and extracted to /home/user/litexl/data on first run
+    (data_extract.c), keeping lite's stock bootstrap untouched;
+    EXEFILE=/home/user/litexl/lite so EXEDIR/data resolution hits it.
+  - Registered in the launcher ("Lite XL", productivity) + Limine module.
+- KERNEL: wm_user_enqueue now stamps live modifier state onto every
+  user-window KEY event (c bits: 1=shift 2=ctrl 4=alt).
+- TERMINAL FIXES (crash on unknown commands):
+  - apps[] whitelist was MISSING ITS NULL TERMINATOR — the lookup loop
+    walked past the array into garbage on every unknown command, ending
+    in wild-pointer faults (observed: fault address = ASCII "litexl",
+    typed command bytes dereferenced as a pointer). Terminated the list.
+  - Added generic module fallback: unknown commands probe the boot-module
+    registry (eigen_load_module) and spawn on hit, so ANY bundled ELF
+    (imguitest, nk_demo, litexl, ...) runs by typing its name; genuine
+    typos now print "<cmd>: command not found" instead of crashing.
+- VERIFIED: full build green; litexl links clean against liblua54.a +
+  FreeType + ring-3 libc.
+
+## 2026 — FreeType taskbar + launcher shell (ring 0)
+- FONT MODULE FIX (real-hardware): `fonts/DejaVuSans.ttf` was only registered
+  under the DEFAULT Limine boot entry — booting Safe Graphics (or any other
+  entry) had no font module, so the shell silently fell back to the 8x16 font
+  ("[FTFONT] DejaVuSans boot module not found" on serial/kernel log).
+  build.sh now guarantees the font module in EVERY boot entry (per-entry
+  check; inserts after that entry's wp5 line when missing). Also raised the
+  kernel module registry cap user_modules[64] → [128]: the Default entry was
+  at 63 modules, one away from silently dropping tail modules.
+- DYNAMIC WALLPAPER PACKAGES: dropping any src/assets/wallpapers/wp*.bmp into
+  the build now just works end to end. (a) build_assets() auto-registers every
+  wallpaper as a Limine module in BOTH entries (inserted after each wp1 line);
+  (b) kernel.c gained a module enumeration API (user_module_total /
+  user_module_at); (c) wallpaper_mgr seed_packages() walks the registry and
+  installs EVERY "wp*" module (wp1…wpN, wpw1, …) as /home/user/wallpaper/
+  <name>.bmp — the old hardcoded wp1..wp5 PKG_MODS list is gone. The picker
+  and File Explorer already auto-detect everything in the folder.
+- KERNEL FREETYPE: the vendored FreeType now also builds for ring 0.
+  New `build_ftkernel()` in build.sh compiles the same FT sources (minus
+  ftsystem.c) with `-mno-sse -mno-sse2` into `bin/obj/libs/freetype/` so
+  the kernel link picks them up. Stock `ftsystem.c` is replaced by
+  `src/kernel/lib/ftsystem_kernel.c`: kmalloc/kfree-backed memory manager,
+  no file streams (FT_Stream_Open always fails; only FT_New_Memory_Face
+  is used). Also added the tiny libc bits ftstdlib.h expects: memchr,
+  qsort (insertion), strtol, getenv stub, and kernel `include/setjmp.h`
+  + naked setjmp/longjmp (FreeType error unwinding).
+- NEW TEXT ENGINE `src/gui/ftfont.c` + `include/gui/ftfont.h`: loads the
+  DejaVuSans boot module IN PLACE via user_module_find() (zero copy),
+  rasterizes grayscale glyphs, caches them keyed by (glyph, px size)
+  with LRU eviction, per-size vertical-metrics cache. API:
+  ftfont_init/ready/height/ascent/width/draw/draw_trunc. Blits through
+  gfx_blend_pixel honoring the gfx clip rect (new gfx_get_clip()).
+  Graceful fallback to the 8x16 font if the module is missing.
+- COMPREHENSIVE TOP TASKBAR (`src/gui/taskbar_mac.c` rewritten):
+  - Left: EigenOS lambda menu button → toggles the LAUNCHER panel;
+    5 virtual-desktop pills (accent-filled active, hover highlight).
+  - Center: running-window strip from the WM — accent dot per window,
+    FreeType title (ellipsized), dimmed+hollow when minimized,
+    accent underline + tint on focus. Left-click: restore+focus /
+    minimize-on-second-click / focus. Middle-click closes the window.
+  - Right tray: live CPU% and RAM% mini-bars (g_sysmon_* samples),
+    clock "Sat 23 Aug HH:MM" (12/24h per personalization), power button
+    with popover (Reboot via acpi_reboot / Shut Down via existing path).
+- LAUNCHER PANEL replaces the old start menu entirely: slide-in panel
+  with search field (caret blink, placeholder, live case-insensitive
+  filter), category sidebar with per-category counts, scrollable app
+  card grid (icon tiles via draw_app_icon_tile + names), scrollbar,
+  footer hints. Keyboard: type to filter, Up/Down/Left/Right select,
+  Enter launches, PageUp/PageDown scroll, Esc closes. Wheel scrolls.
+- START MENU REMOVED: render_menu + menu anim machinery deleted from
+  gui.c; spotlight search overlay deleted (update_search_results,
+  render_search_panel, launch_search_result); old-bar hit zones
+  (start button/desktop switcher/pinned tabs/sound icon) removed.
+  Overlay API repurposed as thin wrappers over the launcher:
+  gui_toggle_start_menu→taskbar_launcher_toggle, gui_open/toggle_search→
+  taskbar_launcher_open_search, gui_is_menu_open/gui_is_overlay_open→
+  taskbar_overlay_open (so wm.c Super+S, key-132 and routing work
+  UNCHANGED). g_layout defaults: top bar 36px, autohide off,
+  monitor+clock on. Click priority in the shell loop: taskbar first,
+  then desktop icons, then modals.
+- BUILD FIX (EFL Task D): ecore_poller_add reconciled to the upstream
+  4-arg signature (type param ignored); ecoretest updated.
+- VERIFIED: full build.sh build green; eigen-x86_64.iso produced;
+  nm shows ftfont_*/FT_*/setjmp linked into eigen.bin.
+
 ## 2026 — ImGui Port (PATH A: ring-3 app, WM untouched)
 - Vendored Dear ImGui v1.92.6 into `src/user/lib/imgui/` (imgui.cpp, imgui_draw.cpp,
   imgui_widgets.cpp, imgui_tables.cpp, imgui_demo.cpp + stb) — compiles clean with

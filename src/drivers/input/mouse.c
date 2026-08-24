@@ -28,6 +28,12 @@ static volatile int mouse_y = 384;
 static volatile int mouse_buttons = 0;
 static volatile int mouse_updated = 0;
 
+// Raw, unscaled, unclamped device deltas accumulated in the IRQ and drained by
+// mouse_get_deltas(). The clamped cursor below ignores these; they drive
+// relative/mouse-look input (e.g. DOOM camera turning).
+static volatile int mouse_dx_acc = 0;
+static volatile int mouse_dy_acc = 0;
+
 static int bound_x = 1024;
 static int bound_y = 768;
 
@@ -325,6 +331,11 @@ void mouse_handler(void) {
             int dy = (int)mouse_packet[2];
             if (mouse_packet[0] & 0x20) dy |= 0xFFFFFF00;  // Sign extend
 
+            // Capture raw, unscaled device deltas for relative input (mouse-look).
+            // The clamped cursor below ignores this; these drive camera turning.
+            mouse_dx_acc += dx;
+            mouse_dy_acc += dy;
+
             // Apply sensitivity multiplier first (so it scales the movement)
             if (mouse_sensitivity == 1) {
                 dx = dx / 2;
@@ -381,6 +392,15 @@ void mouse_handler(void) {
 int mouse_get_x(void) { return mouse_x; }
 int mouse_get_y(void) { return mouse_y; }
 int mouse_get_buttons(void) { return mouse_buttons; }
+
+void mouse_get_deltas(int* dx, int* dy) {
+    int mx = mouse_dx_acc;
+    int my = mouse_dy_acc;
+    mouse_dx_acc = 0;
+    mouse_dy_acc = 0;
+    if (dx) *dx = mx;
+    if (dy) *dy = my;
+}
 
 int mouse_has_update(void) {
     if (mouse_updated) {

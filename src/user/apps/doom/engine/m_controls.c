@@ -57,7 +57,7 @@ int key_useartifact = KEY_ENTER;
 // Hexen key controls
 //
 
-int key_jump = '/';
+int key_jump = KEY_SPACE;
 
 int key_arti_all             = KEY_BACKSPACE;
 int key_arti_health          = '\\';
