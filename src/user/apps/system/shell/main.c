@@ -1,3 +1,21 @@
+/***************************************************************/
+/*                                                             */
+/* Copyright (C) Sidney 2024-2026. All rights reserved.        */
+/* Written by Sidney.                                          */
+/* Distributed under terms of the GNU General Public License.  */
+/*                                                             */
+/***************************************************************/
+
+/* sh — the EigenOS command shell.
+ *
+ * Design in one paragraph: the shell lives on the SLAVE end of a pty that
+ * the Terminal app owns the master of. It reads one cooked line at a time
+ * from stdin, splits it into words, runs builtins (cd/pwd/echo/clear/
+ * exit) itself, and everything else is searched in /user then handed to
+ * /user/busybox with argv[0] set to the typed command so BusyBox dispatch
+ * the right applet. ^C is delivered to the shell, which relays it to the
+ * child it is currently waiting on.
+ */
 /* EigenOS shell (sh) — runs on a PTY slave, spawns programs via
  * EIGEN_SYS_SPAWN_FDS with inherited stdin/stdout/stderr.
  * Builtins: cd pwd exit. Everything else: PATH lookup in /bin,/userapp,
@@ -68,6 +86,9 @@ static int try_spawn(const char* path, int argc, char** argv, int bg) {
 
 int main(int argc, char* argv[]) {
     (void)argc;(void)argv;
+    /* probe: raw write before ANY libc machinery — if this byte never
+       reaches the pty master, the failure is pre-main / fd wiring. */
+    write(1, "SH-ALIVE\n", 9);
     eigen_signal(SIGINT, sigint_handler);
 
     static char line[512];
@@ -75,7 +96,7 @@ int main(int argc, char* argv[]) {
 
     for (;;) {
         /* prompt: user@host:cwd$ */
-        printf("eigen@eigenos:%s$ ", cwd);
+        printf("\x1b[36meigen\x1b[90m@\x1b[36meigenos\x1b[90m:\x1b[34m%s\x1b[90m$\x1b[0m ", cwd);
         fflush(stdout);
 
         int len = 0;
@@ -104,6 +125,12 @@ int main(int argc, char* argv[]) {
             continue;
         }
         if (!strcmp(cmd, "pwd")) { printf("%s\r\n", cwd); continue; }
+        if (!strcmp(cmd, "echo")) {
+            for (int i = 1; i < na; i++) printf("%s%s", argvv[i], i+1<na?" ":"");
+            printf("\r\n");
+            continue;
+        }
+        if (!strcmp(cmd, "clear")) { printf("\x1b[2J\x1b[H"); fflush(stdout); continue; }
 
         /* rebuild argv with absolute cwd-relative resolution later */
         int bg = 0;
@@ -124,10 +151,11 @@ int main(int argc, char* argv[]) {
             ok = try_spawn(path, na, argvv, bg);
         }
         if (!ok) {
-            /* multi-call toolbox fallback */
-            memmove(argvv+1, argvv, na*sizeof(char*));
-            argvv[0] = (char*)"/bin/eigenbox";
-            try_spawn("/bin/eigenbox", na+1, argvv, bg);
+            /* BusyBox dispatch: /user/busybox with argv[0]=applet name */
+            ok = try_spawn("/user/busybox", na, argvv, bg);
+        }
+        if (!ok) {
+            printf("sh: %s: not found\r\n", cmd);
         }
     }
 }

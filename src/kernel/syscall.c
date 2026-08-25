@@ -61,6 +61,7 @@ typedef struct user_blk {
     uint64_t base;          /* user virtual address of the block        */
     uint64_t npages;        /* size in 4 KiB pages                     */
     int      free;          /* 1 = on the free list, 0 = allocated     */
+    int      owner;         /* task id that allocated it (0 = kernel/free) */
     struct user_blk* next;
     struct user_blk* prev;
 } user_blk_t;
@@ -86,6 +87,7 @@ static user_blk_t* user_blk_new(uint64_t base, uint64_t npages, int free) {
     user_blk_t* b = (user_blk_t*)kmalloc(sizeof(user_blk_t));
     if (!b) return 0;
     b->base = base; b->npages = npages; b->free = free;
+    b->owner = 0;
     user_blk_t* cur = user_blocks, *prev = 0;
     while (cur && cur->base < base) { prev = cur; cur = cur->next; }
     b->prev = prev; b->next = cur;
@@ -136,6 +138,7 @@ static uint64_t k_sys_alloc_user(uint64_t size) {
              * so (re)map into the caller before handing the VA out — fresh
              * physical frames, no cross-task aliasing. */
             b->free = 0;
+            { task_t* oc = get_current_task(); b->owner = oc ? oc->id : 0; }
             if (user_map_pages(b->base, b->npages) != 0) {
                 b->free = 1;            /* hand back rather than return garbage */
                 return -1;
@@ -149,7 +152,8 @@ static uint64_t k_sys_alloc_user(uint64_t size) {
     if (base + npages * 4096 > USER_HEAP_LIMIT) return -1;
     if (user_map_pages(base, npages) != 0) return -1;
     user_heap_cur += npages * 4096;
-    user_blk_new(base, npages, 0);
+    { user_blk_t* nb = user_blk_new(base, npages, 0);
+      task_t* oc = get_current_task(); if (nb) nb->owner = oc ? oc->id : 0; }
     return base;
 }
 
@@ -199,9 +203,10 @@ static uint64_t k_sys_write(uint64_t fd, uint64_t buf, uint64_t count, uint64_t 
        a child's inherited pty stdout is fd 1 and must land in the pty ring,
        not the console. Console fallback only for bare descriptors. */
     task_t* cur = get_current_task();
-    if (cur && (cur->fd_types[fd] == FD_PIPE ||
-                cur->fd_types[fd] == FD_PTY ||
-                cur->fd_types[fd] == FD_SOCKET)) {
+    if (cur && fd < MAX_FDS &&
+        (cur->fd_types[fd] == FD_PIPE ||
+         cur->fd_types[fd] == FD_PTY ||
+         cur->fd_types[fd] == FD_SOCKET)) {
         return (uint64_t)sys_write((int)fd, (const char*)buf, (uint32_t)count);
     }
     if ((fd == 1 || fd == 2) &&
@@ -290,7 +295,18 @@ static uint64_t k_sys_spawn(uint64_t name, uint64_t a2, uint64_t a3, uint64_t a4
             k[len] = 0;
             kargv[n] = k;
         }
-        uint64_t rc = (uint64_t)create_user_process_elf_args((const char*)name, n, kargv);
+        /* normalize: argv[0] = program name, args follow (matches execve) */
+        char** with0 = (char**)kmalloc((n + 1) * sizeof(char*));
+        uint64_t rc;
+        if (with0) {
+            with0[0] = (char*)name;
+            for (int i = 0; i < n; i++) with0[i + 1] = kargv[i];
+            rc = (uint64_t)create_user_process_elf_redir((const char*)name,
+                                                         n + 1, with0, 0);
+            kfree(with0);
+        } else {
+            rc = (uint64_t)create_user_process_elf_args((const char*)name, n, kargv);
+        }
         for (int i = 0; i < n; i++) if (kargv[i]) kfree(kargv[i]);
         return rc;
     }
@@ -450,6 +466,25 @@ static uint64_t k_sys_set_tid_address(uint64_t tidptr, uint64_t a2, uint64_t a3,
     (void)a2;(void)a3;(void)a4;
     extern long sys_set_tid_address(uint64_t);
     return (uint64_t)sys_set_tid_address(tidptr);
+}
+
+static uint64_t k_sys_stat(uint64_t p, uint64_t o, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_stat(const char*,void*);return (uint64_t)sys_stat((const char*)p,(void*)o);}
+static uint64_t k_sys_fstat(uint64_t fd, uint64_t o, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_fstat(int,void*);return (uint64_t)sys_fstat((int)fd,(void*)o);}
+static uint64_t k_sys_lstat(uint64_t p, uint64_t o, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_lstat(const char*,void*);return (uint64_t)sys_lstat((const char*)p,(void*)o);}
+static uint64_t k_sys_chdir(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4){(void)a2;(void)a3;(void)a4;extern long sys_chdir(const char*);return (uint64_t)sys_chdir((const char*)p);}
+static uint64_t k_sys_getcwd(uint64_t b, uint64_t sz, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_getcwd(char*,uint64_t);return (uint64_t)sys_getcwd((char*)b,sz);}
+static uint64_t k_sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4){(void)a4;extern long sys_ioctl(int,uint64_t,void*);return (uint64_t)sys_ioctl((int)fd,req,(void*)arg);}
+static uint64_t k_sys_access(uint64_t p, uint64_t m, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_access(const char*,int);return (uint64_t)sys_access((const char*)p,(int)m);}
+static uint64_t k_sys_uname(uint64_t b, uint64_t a2, uint64_t a3, uint64_t a4){(void)a2;(void)a3;(void)a4;extern long sys_uname(void*);return (uint64_t)sys_uname((void*)b);}
+static uint64_t k_sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oact, uint64_t sz){extern long sys_rt_sigaction(int,void*,void*,uint64_t);return (uint64_t)sys_rt_sigaction((int)sig,(void*)act,(void*)oact,sz);}
+static uint64_t k_sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old, uint64_t sz){extern long sys_rt_sigprocmask(int,void*,void*,uint64_t);return (uint64_t)sys_rt_sigprocmask((int)how,(void*)set,(void*)old,sz);}
+static uint64_t k_sys_getppid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4){(void)a1;(void)a2;(void)a3;(void)a4;extern long sys_getppid(void);return (uint64_t)sys_getppid();}
+static uint64_t k_sys_gettimeofday(uint64_t tv, uint64_t tz, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_gettimeofday(void*,void*);return (uint64_t)sys_gettimeofday((void*)tv,(void*)tz);}
+static uint64_t k_sys_clock_gettime(uint64_t clk, uint64_t tp, uint64_t a3, uint64_t a4){(void)a3;(void)a4;extern long sys_clock_gettime(int,void*);return (uint64_t)sys_clock_gettime((int)clk,(void*)tp);}
+static uint64_t k_sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t a4){
+    (void)dirfd; /* AT_FDCWD only: per-task cwd resolves relative paths */
+    (void)a4;
+    return (uint64_t)sys_open((const char*)path, (int)flags);
 }
 
 static uint64_t k_sys_sigreturn(uint64_t a1, uint64_t a2,
@@ -1288,10 +1323,32 @@ static syscall_fn syscall_table[SYSCALL_COUNT] = {
     k_sys_writev,       // 41
     k_sys_dup2,         // 42
     k_sys_arch_prctl,   // 43
-    k_sys_set_tid_address // 44
+    k_sys_set_tid_address, // 44
+    k_sys_stat, k_sys_fstat, k_sys_lstat,          // 45-47
+    k_sys_chdir, k_sys_getcwd, k_sys_ioctl,        // 48-50
+    k_sys_access, k_sys_uname,                     // 51-52
+    k_sys_rt_sigaction, k_sys_rt_sigprocmask,      // 53-54
+    k_sys_getppid, k_sys_gettimeofday, k_sys_clock_gettime, // 55-57
+    k_sys_openat // 58
 };
 
 uint64_t syscall_handler(uint64_t num, uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4) {
+    /* first-syscall tracer for the shell: pins where it stalls (or proves
+       it never reaches a syscall at all) */
+    {
+        static int sh_seen = 0;
+        task_t* tc = get_current_task();
+        if (!sh_seen && tc && tc->name[0] == 's' && tc->name[1] == 'h' &&
+            tc->name[2] == 0) {
+            sh_seen = 1;
+            extern void serial_puts(const char*);
+            extern void serial_u64(uint64_t);
+            serial_puts("[SH] first syscall num="); serial_u64(num);
+            serial_puts(" fd_types01=");
+            serial_u64(((uint64_t)tc->fd_types[0] << 8) | tc->fd_types[1]);
+            serial_puts("\n");
+        }
+    }
     if (num >= SYSCALL_COUNT) return -1;
     syscall_fn fn = syscall_table[num];
     if (!fn) return -1;
@@ -1306,3 +1363,16 @@ int klog_console_write(const char* s, int n) {
     return n;
 }
 
+/* Free every user-heap block owned by `owner` (called on task exit).
+   The mappings lived in the exiting task's pml4, which dies with it —
+   no unmap needed. Frees coalesce so the arena stays defragmented. */
+void user_heap_release_owner(int owner) {
+    if (owner <= 0) return;
+    for (user_blk_t* b = user_blocks; b; b = b->next) {
+        if (!b->free && b->owner == owner) {
+            b->free = 1;
+            b->owner = 0;
+            user_blk_coalesce(b);
+        }
+    }
+}

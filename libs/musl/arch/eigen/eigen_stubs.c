@@ -203,3 +203,8 @@ int getgrouplist(const char* user, gid_t group, gid_t* groups, int* ngroups) {
 #include <sys/mman.h>
 int mlock(const void* addr, size_t len) { (void)addr; (void)len; return 0; }
 int munlock(const void* addr, size_t len) { (void)addr; (void)len; return 0; }
+#include <setjmp.h>
+extern int __sigsetjmp(sigjmp_buf buf, int savemask);
+int sigsetjmp(sigjmp_buf buf, int savemask) {
+    return __sigsetjmp(buf, savemask);
+}

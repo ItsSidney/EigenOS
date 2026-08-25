@@ -70,8 +70,13 @@ compile() {
   skip_match "$src" && return 0
   [ -f "$src" ] || return 0
   local obj="$OUT/${src#libs/musl/src/}"
-  obj="${obj%.c}.o"
+  obj="${obj%.c}.o"; obj="${obj%.s}.o"
   mkdir -p "$(dirname "$obj")"
+  if [[ "$src" == *.s ]]; then
+    echo "  AS $src"
+    gcc -c "$src" -o "$obj" || { echo "  [FAIL] $src"; return 1; }
+    return 0
+  fi
   echo "  CC $src"
   $CC $CFLAGS "$src" -o "$obj" || {
     echo "  [FAIL] $src"
@@ -105,6 +110,8 @@ for f in $(find $MUSL/src/stdlib -maxdepth 1 -name '*.c' | sort) \
          $(find $MUSL/src/time -maxdepth 1 -name '*.c' | sort) \
           $(find $MUSL/src/setjmp -maxdepth 1 -name '*.c' | sort) \
           $(find $MUSL/src/setjmp/x86_64 -name '*.s' | sort) \
+          $(find $MUSL/src/signal/x86_64 -name '*.s' | sort) \
+          $(find $MUSL/src/termios -maxdepth 1 -name '*.c' | sort) \
           $(find $MUSL/src/locale -maxdepth 1 -name '*.c' | sort) \
           $(find $MUSL/src/multibyte -maxdepth 1 -name '*.c' | sort) \
           $(find $MUSL/src/temp -maxdepth 1 -name '*.c' | sort) \
@@ -131,11 +138,16 @@ done
 
 # 3b) Process / linux / threads subsystems (real fork/execve/pthread).
 for f in $(find $MUSL/src/process -maxdepth 1 -name '*.c' | sort) \
+         $(find $MUSL/src/regex -maxdepth 1 -name '*.c' | sort) \
+         $(find $MUSL/src/conf -maxdepth 1 -name '*.c' | sort) \
+         $(find $MUSL/src/passwd -maxdepth 1 -name '*.c' | sort) \
+         $(find $MUSL/src/legacy -maxdepth 1 -name '*.c' | sort) \
+         $(find $MUSL/src/time -name 'tzset.c' | sort) \
          $(find $MUSL/src/linux -maxdepth 1 -name '*.c' | sort) \
          $(find $MUSL/src/sched -maxdepth 1 -name '*.c' | sort); do
   case "$f" in
-    */clone.c|*/vfork.c|*/posix_spawn*.c|*/fexecve.c|*/system.c|*/popen.c)
-      continue ;;   # need __clone asm / vfork semantics we bridge separately
+    */clone.c|*/posix_spawn*.c|*/fexecve.c|*/system.c|*/popen.c|*/ftw.c)
+      continue ;;   # need __clone asm / spawn-family we bridge separately
   esac
   compile "$f" || FAIL=1
 done

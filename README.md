@@ -1,236 +1,94 @@
-<p align="center">
-  <img src="misc/logo.svg" width="110" alt="EigenOS lambda mark">
-</p>
+# EigenOS λ
 
-# EigenOS
+A from-scratch **64-bit hobby operating system** with a modern twist: a custom kernel, a real POSIX userspace (musl), **289 BusyBox commands**, a compositing GUI with Papirus icons — and DOOM.
 
-An x86_64 operating system written from scratch in C and a bit of assembly.
-It boots with Limine, runs ring-3 ELF programs out of an in-memory filesystem,
-draws its own desktop, drives an e1000 NIC with its own TCP/IP stack, and as
-of recently speaks TLS from inside the kernel.
+```
+EigenOS 1.0.0-eigen x86_64
+```
 
-Every matrix has eigenvalues, Av = λv. Hence the logo.
+![EigenOS](misc/logo.png)
 
-This is a one-person project. It builds in about two minutes, fits on a
-bootable ISO, and is meant to be read as much as run.
+## What makes it interesting
 
----
+Most hobby OSes stop at "prints text to VGA". EigenOS boots into a full desktop where you can open a terminal, run `ls -la`, edit files in `vi`, play DOOM, and browse your filesystem with real icons — all on a kernel and libc that were built for this OS specifically.
 
-## Status
+## Feature matrix
 
-Things that work, verified in QEMU (and mostly on the boot log you see every
-time it starts):
+### Kernel (x86_64)
+| Subsystem | Details |
+|---|---|
+| Boot | Limine protocol, SMP bring-up with AP parking, KVM/q35 + multi-vendor tested |
+| Memory | PMM + VMM, per-process page tables, hhdm, 256MB user heap with owner tracking (no cross-process leaks) |
+| Scheduler | Round-robin, preemption, sleeping, FPU/SSE state save (eager FXSAVE), kernel stack canaries |
+| Processes | `fork` (eager AS copy), `execve` (in-place image swap), `wait4`, process groups, SIGINT forwarding |
+| Signals | Tier-1 POSIX signals with trampoline injection + `sigreturn` |
+| TLS | Per-task `IA32_FS_BASE`, `arch_prctl(ARCH_SET_FS)`, pthread-ready layout |
+| FS | Inode-style RAM FS (node 0 = `/`), per-task cwd, FHS layout (`/bin /user /etc /dev /home`), **disk persistence** (two-slot CRC A/B snapshots on virtio-blk) |
+| Drivers | virtio-blk, e1000 NIC + TCP/IP, AC97/HDA audio, PS/2 + USB mice, RTC, ext-ish flat + VFS mounts |
+| Syscalls | 59-entry Eigen ABI + **Linux-compatible layer** for musl |
 
-- BIOS and UEFI boot through Limine, with the boot progress drawn on screen
-- A desktop: window manager, taskbar, desktop switcher, themes, wallpapers
-- Ring-3 ELF userland loaded straight from Limine modules — no initrd, no ELF
-  loader tricks, the bootloader *is* the package manager
-- RAM filesystem on `/`, FAT32 for anything that lands on a real disk
-- PS/2 keyboard and mouse, plus USB HID
-- e1000 networking with DHCP, DNS, ICMP ping, TCP and UDP sockets
-- A TLS 1.2 client inside the kernel (wolfSSL) with the Mozilla CA bundle, so
-  the bundled browser can actually open https:// pages
-- AC97 audio, PC speaker, a piano app because why not
-- DOOM runs. This was non-negotiable.
+### Userspace
+| Piece | Details |
+|---|---|
+| **musl libc (real)** | Full build: process, linux, sched, regex, passwd, termios, legacy, signal-asm — 1000+ objects. No shim shortcuts for new ports. |
+| **BusyBox 1.36** | **289 applets** compiled against our musl: `ls cat grep sed awk vi top ps wget-ready...` dispatched via argv[0] |
+| **Terminal** | Kernel PTY subsystem (cooked + raw line discipline, ^C→SIGINT, winsize) + VT100/xterm emulator: 16-color SGR, scrollback, cursor addressing |
+| **Shell** | `sh.elf`: prompt, builtins, PATH lookup, BusyBox fallback, job-friendly ^C relay |
+| **GUI** | Compositing window manager: drag/resize/snap/maximize, 20px top taskbar, cascade app menu, Nordzy + **Papirus** icons, λ logo with 6 color variants (incl. rainbow) |
+| **Apps** | File Explorer (icon toolbar, list/grid, Papirus type icons), Terminal, Settings, Calculator, Clock, Calendar, Text Editor, Image Viewer, Process Viewer, Graphing, EigenDeck, **DOOM (Chocolate-DOOM port)**, glgears (TinyGL) |
+| **Media** | AC97/HDA audio, BMP/PNG/JPEG decoders (kernel + user), FreeType text rendering |
 
-Things that are rough:
+### Developer experience
+- One-command build: `./build.sh build` → bootable ISO
+- Incremental, cached; BusyBox/musl pipelines fully automated (`tools/build-musl.sh`, `tools/build-busybox.sh`)
+- Serial breadcrumbs + in-kernel fault screens with register dumps and user-stack backtraces
+- Test apps for every subsystem: `forktest`, `posixtest`, `pthreadtest`, `polltest`...
 
-- The TCP stack works but hasn't survived a hostile network. Treat it as demo grade.
-- TLS is 1.2 only for now, and there's a single global TLS connection at a time.
-- Without KVM everything runs under TCG emulation, which is slow but honest.
-- The EFL ports cover the foundation (see below); Evas and everything above
-  them are still on the wishlist.
-
----
-
-## Building and running
-
-You need gcc, nasm, xorriso, and qemu-system-x86_64:
+## Quick start
 
 ```bash
-sudo apt install build-essential nasm xorriso qemu-system-x86
+git clone https://github.com/ItsSidney/EigenOS.git
+cd EigenOS
+./build.sh build          # produces eigen-x86_64.iso
 ```
 
-Then:
+Run it:
 
 ```bash
-./build.sh build    # kernel + userland + ISO  ->  eigen-x86_64.iso
-./build.sh run      # boots it in QEMU, VNC on :1
+qemu-system-x86_64 -enable-kvm -cpu host -m 4G -smp 4 -machine q35 \
+  -cdrom eigen-x86_64.iso -drive file=disk.img,format=raw,if=virtio \
+  -net nic,model=e1000 -net user
 ```
 
-`run` opens a VNC server on port 5901; if `vncviewer` is installed it will
-connect for you, otherwise point your viewer at `:1`. It also clears stale
-QEMU instances that would otherwise sit on that port, which sounds aggressive
-but saves typing.
+In the desktop: open **Terminal** → try `uname -a`, `ls`, `cat /etc/passwd`, `vi`, `top` — all real BusyBox.
 
-KVM is used automatically when `/dev/kvm` is accessible. If you're not in the
-`kvm` group (I wasn't), you get pure TCG emulation — slower, entirely usable.
-
-Other targets:
-
-```bash
-./build.sh log      # headless boot, serial output -> eigen_qemu.log
-./build.sh clean    # remove build artifacts
-```
-
-There are also single-library targets left over from porting work, handy when
-touching one of them: `eina`, `eo`, `zlib`, `emile`, `eet`, `png`, `jpeg`,
-`ecore`. Each rebuilds just that library and its dependencies.
-
----
-
-## What's inside
+## Architecture snapshot
 
 ```
-src/
-  boot/         early assembly, GDT, entry
-  kernel/       memory, tasks, syscalls, net stack, TLS glue
-  drivers/      video, input, audio, storage, network, PCI, ACPI
-  filesystem/   VFS, ramfs, FAT32
-  gui/          window manager, widgets, icons, theme
-  gfx/          framebuffer helpers, splash
-  engine/       animation engine
-  libs/         tinygl, tiny png/jpeg helpers
-  user/         everything ring-3:
-    lib/          libc shims, userlib/userui, pthread stubs,
-                  ports: eina eo eet emile zlib png jpeg ecore freetype imgui
-    apps/         terminal, browser, games, viewers, test programs
-libs/wolfssl/   vendored wolfSSL, trimmed to what we compile
-include/        kernel + userland headers
-config/         limine.conf, linker script
-tools/          vendored Limine binaries, app scaffolders
-docs/           notes, including an old scripting-language tutorial
+┌─────────────────────────────────────────────┐
+│ Apps: sh · busybox(289) · explorer · DOOM   │
+├─────────────────────────────────────────────┤
+│ musl libc (real POSIX) + Eigen shim         │
+├─────────────────────────────────────────────┤
+│ Syscall ABI (59): fork/execve/wait4/stat/   │
+│ getdents64/pty/arch_prctl/ioctl/uname...    │
+├─────────────────────────────────────────────┤
+│ Kernel: sched · VMM · signals · VFS+persist │
+│ drivers: virtio-blk e1000 AC97 PS/2 RTC     │
+├─────────────────────────────────────────────┤
+│ GUI: WM · taskbar · icon themes · FreeType  │
+└─────────────────────────────────────────────┘
 ```
 
-The kernel is compiled `-ffreestanding -mcmodel=kernel`, static linked,
-no PIE. Userland is plain ELF64 linked `-nostdlib` against our own libc
-shims — which includes software floating point math, because the userland
-is built `-mno-80387` and there is no FPU state saving in the scheduler yet.
-Yes, `sqrt()` is a function call into our own libm. It's fine. Mostly.
-
----
-
-## Networking and TLS
-
-The IP stack is homegrown: Ethernet + ARP, IPv4, ICMP, UDP, TCP, DNS resolver,
-DHCP lease at boot. Drivers: e1000 (QEMU's default NIC). Everything above the
-driver lives in `src/kernel/net/`.
-
-TLS used to be BearSSL. It's wolfSSL now — same job, but upstream is actively
-maintained and I wanted PEM-formatted CA bundles instead of hand-rolled trust
-anchors. The swap kept the old kernel API (`br_tls_*`) so nothing else had to
-change; only the implementation in `src/kernel/net/tls.c` moved.
-
-How it's wired for a kernel with no OS underneath:
-
-- `WOLFSSL_USER_IO` — record I/O goes through callbacks that talk to kernel
-  sockets directly. No BSD socket layer, no `select()`.
-- RNG seeding uses `rdrand`, but only after CPUID says the CPU has it. QEMU's
-  default `qemu64` model doesn't, and executing `rdrand` anyway raises #UD,
-  which cascades into a triple fault. That was a fun afternoon. The fallback
-  mixes RTC fields with timer ticks — weak entropy, acceptable for a demo OS,
-  and it never faults.
-- `USER_TIME` hooks feed certificate validity checks from the RTC.
-- The CA store is generated from the Mozilla bundle (121 roots) into
-  `src/kernel/net/ca_roots.h` as a PEM blob.
-
-At boot the kernel runs a self-test and prints:
-
-```
-[WOLFSSL] self-test ok (CAs loaded, RNG ok)
-```
-
-If that line shows up, the whole crypto stack came up before any network
-existed. **edrowser** (the bundled browser) then uses it for https:// pages.
-
----
-
-## Ports
-
-A running tally of libraries made to live freestanding in this environment.
-Each one has a matching test program that prints `[NAME] ALL PASS`:
-
-| Library        | Version  | Notes                                            |
-|----------------|----------|--------------------------------------------------|
-| zlib           | 1.3.1    | Z_SOLO, custom allocator                          |
-| libpng         | 1.6.43   | SIMD off, software-only                           |
-| libjpeg (IJG)  | 9e       | jmemnobs backend, encode+decode verified          |
-EFL (Eina, Eo, Emile, Eet, Ecore, Evas, Edje, Elementary) was previously
-ported here as the ring-3 GUI toolkit and has since been removed entirely.
-The OS now uses its own native compositing desktop under `src/gui/`
-(framebuffer + GFX/GPU drivers, Freetype text, input stack); see
-`src/gui/wm.c` and `src/drivers/video/`. No EFL code remains in the tree.
-
----
-
-## Applications
-
-GUI apps (ring-3): terminal, edrowser (web), weather, file explorer,
-calculator, calendar, clock, settings, process viewer, image viewer,
-paint studio, bitmap maker, graphing calculator, julia and mandelbrot
-renderers, colour wheel, on-screen keyboard, hex dump, kernel log, three
-TinyGL demos including glgears, imgui playground, FreeType glyph viewer,
-and DOOM.
-
-Terminal utilities: `awk` (the one true awk, ported), `kilo`, plus the test
- suite — `posixtest ftglyph pthreadtest setjmptest polltest
-zlibtest pngtest jpegtest`. After any library work, run the
-matching test in the VM. If it ends in ALL PASS, ship it.
-
-Small ritual worth knowing: `imgview` generates `/demo.png` and `/demo.jpg`
-itself at startup — encoding a gradient through libpng and libjpeg, writing
-both to the ramfs, then decoding them back to the screen. Press P and J to
-flip between lossless and lossy. The whole codec stack, exercised by one key.
-
----
-
-## Adding an application
-
-```bash
-tools/new_app.sh myapp           # single-file app
-tools/new_folder_app.sh myapp    # multi-file app with build.conf
-```
-
-Folder apps register themselves as Limine modules at build time; single-file
-apps need a line in `config/limine.conf` and an entry in the terminal's app
-list (`src/user/apps/system/terminal/main.c`). Rebuild, boot, type the name.
-
----
-
-## Notes on the tree
-
-- `bin/` and the ISO are never committed. `git status` staying clean means
-  source state, not build state.
-- The Limine binaries are vendored under `tools/bootloader/` (~4 MB) so the
-  build works offline.
-- `libs/wolfssl/` is vendored and trimmed: docs, examples, tests, benchmarks,
-  architecture-specific assembly, post-quantum experiments, and ciphers we
-  don't negotiate are removed. What remains is exactly what `build.sh`
-  compiles, roughly 29 MB instead of 127 MB.
-- `docs/eigenc_tutorial.md` documents a small scripting language that existed
-  in an earlier incarnation. The interpreter is gone; the tutorial survives
-  as a fossil.
-
----
-
-## FAQ
-
-**Why the lambda?**
-Eigenvalues. Also it looks good stroked in green.
-
-**Why x86_64 only?**
-Because the GDT/TSS/paging code is ISA-specific and rewriting it for another
-target is a project, not a patch. Never say never.
-
-**Daily driver?**
-No. It's a toy in the affectionate sense — a thing built to understand every
-layer, where "it crashed" always means "I get to find out why."
-
----
+## Roadmap
+- [ ] Haiku-style top menu bar (Deskbar)
+- [ ] Shared widget kit (buttons/sliders/graphs) across all apps
+- [ ] Socket syscall bridge → `wget`, `ping`, `nc` online
+- [ ] BusyBox `ash` as alternative shell
+- [ ] Copy-on-write fork, dynamic linking (`ld-musl`)
 
 ## License
+GPL — see headers. Third-party components (musl, BusyBox, DOOM, FreeType, libpng/libjpeg/zlib, wolfSSL, TinyGL) keep their own licenses in-tree.
 
-Source is GPL-3.0, matching the headers on every file. Vendored components
-keep their own licenses: Limine (BSD-2-clause), wolfSSL (GPLv2/GPLv3 or
-commercial, per its COPYING), zlib, libpng, libjpeg, EFL parts (LGPL-2.1),
-FreeType (FTL/GPL-2.0), and the DOOM port's assorted heritage.
+---
+*Built with too much coffee and an unreasonable number of page-fault dumps.*

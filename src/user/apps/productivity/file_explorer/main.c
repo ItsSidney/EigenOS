@@ -16,7 +16,27 @@
 
 #include "userlib.h"
 #include "userui.h"
+#include <string.h>
+#include <strings.h>
 #include "vector_icons.h"
+#include "fe_icons.h"
+
+/* Pick the Papirus icon name for a directory entry (see fe_icons.h). */
+static const char* fe_icon_for(int is_dir, const char* name) {
+    if (is_dir) return "folder";
+    const char* ext = strrchr(name, '.');
+    if (!ext) return "exec";
+    if (!strcasecmp(ext, ".png") || !strcasecmp(ext, ".bmp") ||
+        !strcasecmp(ext, ".jpg") || !strcasecmp(ext, ".jpeg")) return "image";
+    if (!strcasecmp(ext, ".wav") || !strcasecmp(ext, ".mp3") ||
+        !strcasecmp(ext, ".mod")) return "music";
+    if (!strcasecmp(ext, ".mp4") || !strcasecmp(ext, ".avi")) return "video";
+    if (!strcasecmp(ext, ".zip") || !strcasecmp(ext, ".tar") ||
+        !strcasecmp(ext, ".gz")) return "archive";
+    if (!strcasecmp(ext, ".elf") || !strcasecmp(ext, ".wad")) return "exec";
+    return "file";
+}
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -269,12 +289,9 @@ static void render_all(void) {
                     eigen_draw_rect(win_fb, cur_w, cur_h, cont_x, cy, cont_w, ROW_H - 4, accent);
                 }
 
-                /* File / Folder icon & name */
-                if (filtered[i].is_dir) {
-                    eigen_draw_text(win_fb, cur_w, cur_h, cont_x + 8, cy + 6, "[DIR]", folder_clr);
-                } else {
-                    eigen_draw_text(win_fb, cur_w, cur_h, cont_x + 8, cy + 6, "[FILE]", dim_clr);
-                }
+                /* Papirus icon + name (see fe_icons.h for the blitter) */
+                fe_icon_draw(fe_icon_for(filtered[i].is_dir, filtered[i].name),
+                             win_fb, cur_w, cur_h, cont_x + 8, cy + 4);
                 eigen_draw_text(win_fb, cur_w, cur_h, cont_x + 64, cy + 6, filtered[i].name, text_clr);
 
                 /* Size */
@@ -298,11 +315,9 @@ static void render_all(void) {
                 eigen_draw_fillrect(win_fb, cur_w, cur_h, cx, cy, CARD_W, CARD_H, (i == selected_idx) ? sel_bg : 0x161B22);
                 eigen_draw_rect(win_fb, cur_w, cur_h, cx, cy, CARD_W, CARD_H, (i == selected_idx) ? accent : border_clr);
 
-                if (filtered[i].is_dir) {
-                    eigen_draw_text(win_fb, cur_w, cur_h, cx + 24, cy + 20, "[DIR]", folder_clr);
-                } else {
-                    eigen_draw_text(win_fb, cur_w, cur_h, cx + 20, cy + 20, "[FILE]", dim_clr);
-                }
+                fe_icon_draw(fe_icon_for(filtered[i].is_dir, filtered[i].name),
+                             win_fb, cur_w, cur_h,
+                             cx + (CARD_W - 32) / 2, cy + 14);
 
                 char card_name[12];
                 strncpy(card_name, filtered[i].name, 10);

@@ -1,0 +1,6 @@
+/* stub blk */
+#define BLKROSET 0x125D
+#define BLKROGET 0x125E
+#define BLKGETSIZE64 0x80081272
+#define BLKSSZGET 0x1268
+#define BLKFLSBUF 0x1261

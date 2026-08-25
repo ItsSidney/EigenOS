@@ -482,7 +482,7 @@ int create_user_process_elf_redir(const char* name, int argc, char* const argv[]
     for (int f = 0; f < MAX_FDS; f++) { tasks[slot].fds[f] = 0; tasks[slot].fd_flags[f] = 0; tasks[slot].fd_offsets[f] = 0; }
 
     int j = 0;
-    while (name[j] && j < 31) { tasks[slot].name[j] = name[j]; j++; }
+    while (modname[j] && j < 31) { tasks[slot].name[j] = name[j]; j++; }
     tasks[slot].name[j] = '\0';
 
     /* Install inherited stdin/stdout/stderr (slots 0..2). */
@@ -646,14 +646,28 @@ int create_user_process_elf_redir(const char* name, int argc, char* const argv[]
     uint64_t* a = (uint64_t*)arr;
     a[0] = (uint64_t)(nargs + 1);                   /* argc includes argv[0] */
     uint64_t sp = top - slen;                       /* argv strings: [top-slen, top-elen) */
-    for (size_t j = 0; j < nlen; j++) ((char*)sp)[j] = name[j];
-    ((char*)sp)[nlen] = 0;
-    a[1] = sp;                                      /* argv[0] = program name */
-    sp += nlen + 1;
-    for (int i = 0; i < nargs; i++) {
+    /* POSIX exec: argv[0] is whatever the CALLER passed, not the path.
+       BusyBox-style multi-call binaries dispatch on it. Fall back to the
+       module name when the caller passed no argv. */
+    int argv_present = (argv && nargs > 0 && argv[0] && argv[0][0]) ? 1 : 0;
+    const char* argv0 = argv_present ? argv[0] : name;
+    size_t a0len = 0;
+    while (argv0[a0len]) a0len++;
+    if (a0len > nlen) a0len = nlen;                  /* strings region sized for name */
+    for (size_t j = 0; j < a0len; j++) ((char*)sp)[j] = argv0[j];
+    ((char*)sp)[a0len] = 0;
+    a[1] = sp;                                      /* argv[0] = caller's argv[0] */
+    sp += nlen + 1;                                  /* advance by name's slot size */
+    /* When the caller supplied argv (SPAWN_FDS), argv[0] is already on the
+       stack as a[1] — copy only argv[1..] as a[2..]. The legacy SYS_SPAWN
+       path passes args WITHOUT a program name, so its argv[0..] all land
+       after a[1]... except its argv[0] slot must stay empty: it passes
+       argc real args and we've already used `name` as argv[0]. */
+    int arg_start = argv_present ? 1 : 0;
+    for (int i = arg_start; i < nargs; i++) {
         for (size_t j = 0; j < arg_len[i]; j++) ((char*)sp)[j] = args_copy[i][j];
         ((char*)sp)[arg_len[i]] = 0;
-        a[i + 2] = sp;                              /* argv[1..n] = real args */
+        a[i - arg_start + 2] = sp;                  /* argv[1..n] */
         sp += arg_len[i] + 1;
     }
     /* argv NULL then envp block then auxv terminator — musl _start walks
@@ -882,6 +896,12 @@ void exit_task(int code) {
                 t->fd_pipe[i] = 0;
                 t->fd_flags_extra[i] = 0;
             }
+        }
+        // Release the task's user-heap blocks so the arena doesn't leak
+        // across process lifetimes (DOOM's 64MB WAD cache etc.).
+        {
+            extern void user_heap_release_owner(int owner);
+            user_heap_release_owner(t->id);
         }
         // Remember the stacks so we can free them after switching away.
         uint64_t old_kernel_stack = t->kernel_stack_base;
@@ -1231,9 +1251,26 @@ uint64_t schedule(uint64_t current_rsp) {
     int found_ready = 0;
     do {
         next_task = (next_task + 1) % MAX_TASKS;
-        if (tasks[next_task].state == TASK_READY) {
+        if (tasks[next_task].state == TASK_READY &&
+            tasks[next_task].kernel_stack_base != 0 &&
+            tasks[next_task].rsp != 0) {
             found_ready = 1;
             break;
+        }
+        if (tasks[next_task].state == TASK_READY &&
+            (tasks[next_task].kernel_stack_base == 0 ||
+             tasks[next_task].rsp == 0)) {
+            /* corpse with a stale READY: neutralize + report once */
+            tasks[next_task].state = TASK_DEAD;
+            static int corpse_reported = 0;
+            if (!corpse_reported) {
+                corpse_reported = 1;
+                extern void serial_puts(const char*);
+                extern void serial_u64(uint64_t);
+                serial_puts("[SCHED] neutralized corpse task ");
+                serial_u64((uint64_t)tasks[next_task].id);
+                serial_puts("\n");
+            }
         }
     } while (next_task != start_idx);
     
@@ -1261,6 +1298,15 @@ uint64_t schedule(uint64_t current_rsp) {
     current_task_idx = next_task;
     task_t* next = &tasks[current_task_idx];
     next->state = TASK_RUNNING;
+    { static int sh_dispatch_seen = 0;
+      if (!sh_dispatch_seen && next->ring == TASK_RING3 && next->ppid > 1) {
+          sh_dispatch_seen = 1;
+          extern void serial_puts(const char*);
+          extern void serial_u64(uint64_t);
+          serial_puts("[SCHED] dispatch r3child id="); serial_u64((uint64_t)next->id);
+          serial_puts(" rip="); serial_u64(*(uint64_t*)(next->rsp + 15*8));
+          serial_puts("\n");
+      } }
     
     // Update TSS with the TOP of next task's kernel stack buffer.
     // Use (base + KERNEL_STACK_SIZE), NOT kernel_stack_top: this sits 8 bytes
@@ -1314,6 +1360,14 @@ uint64_t schedule(uint64_t current_rsp) {
         serial_puts(" cur_task_idx="); serial_u64(current_task_idx);
         serial_puts(" cur_rsp="); serial_u64(current_rsp);
         serial_puts("\n");
+        /* Never iretq into a frame we do not trust: drop to idle. */
+        next->state = TASK_DEAD;
+        current_task_idx = -1;
+        tss_set_user_rsp0((uint64_t)&idle_stack[512]);
+        extern uint64_t vmm_kernel_pml4_phys;
+        if (vmm_kernel_pml4_phys)
+            __asm__ volatile("mov %0, %%cr3" : : "r"(vmm_kernel_pml4_phys) : "memory");
+        return idle_rsp;
     }
 
     return next->rsp;
@@ -1324,6 +1378,21 @@ int create_user_process_elf_args(const char* name, int argc, char* const argv[])
     return create_user_process_elf_redir(name, argc, argv, no_redir);
 }
 
+/* ================================================================== */
+/* THE POSIX PROCESS LAYER — what each syscall actually does here       */
+/*                                                                      */
+/* fork:      walks the caller's user page tables through the hhdm and  */
+/*            copies every mapped page into a fresh address space, then */
+/*            clones the in-flight syscall frame so the child resumes   */
+/*            at the same RIP with rax=0. No COW yet: eager copy.       */
+/* execve:    reads the ELF through the fs table, builds a brand new    */
+/*            address space in-place and REWRITES the saved int80 frame */
+/*            so the returning iretq lands straight at the new entry.   */
+/* wait4:     scans for DEAD children, reports WEXITSTATUS-style codes. */
+/* getdents64: walks a directory's children in slot order into Linux    */
+/*            dirent64 records; the fd offset doubles as the cursor.    */
+/* arch_prctl: ARCH_SET_FS loads the task's TLS base into IA32_FS_BASE; */
+/*            the scheduler re-loads it on every context switch.        */
 /* ================================================================== */
 /* POSIX process syscalls (fork/execve/wait4/getdents64/readv/writev/ */
 /* dup2/arch_prctl/set_tid_address) — the foundation for a hosted musl.*/
@@ -1764,5 +1833,190 @@ int   ktask_set_cwd(int idx) {
     task_t* cur = get_current_task();
     if (!cur) return -1;
     cur->cwd_node = idx < 0 ? 0 : idx;
+    return 0;
+}
+
+/* ================================================================== */
+/* BusyBox-readiness syscalls: stat family, chdir/getcwd, ioctl,       */
+/* access, uname, rt_sigaction/procmask, getppid, gettimeofday,        */
+/* clock_gettime.                                                      */
+/* ================================================================== */
+
+/* musl x86_64 struct stat layout (packed, verified offsets) */
+struct eigen_kstat {
+    uint64_t dev, ino, nlink;
+    uint32_t mode, uid, gid, pad0;
+    uint64_t rdev, size, blksize, blocks;
+    uint64_t atim[2], mtim[2], ctim[2];
+    uint64_t unused[3];
+} __attribute__((packed));
+
+static void fill_kstat(struct eigen_kstat* st, int idx) {
+    file_t* f = fs_table_entry(idx);
+    memset(st, 0, sizeof(*st));
+    if (!f) return;
+    st->dev = 1;
+    st->ino = (uint64_t)idx + 2;
+    st->nlink = 1;
+    st->mode = (f->type == FS_DIRECTORY ? 0x4000 /*S_IFDIR*/ : 0x8000 /*S_IFREG*/)
+             | 0755;
+    st->uid = 0; st->gid = 0;
+    st->size = (uint64_t)(f->size < 0 ? 0 : f->size);
+    st->blksize = 4096;
+    st->blocks = (st->size + 511) / 512;
+    st->mtim[0] = f->modified_time; st->ctim[0] = f->modified_time;
+}
+
+extern int fs_resolve_path(const char* path);   /* exported resolver */
+
+long sys_stat(const char* path, void* out) {
+    if (!path || !out) return -EIGEN_ERR_INVAL;
+    int e = fs_resolve_path(path);
+    if (e < 0) return -EIGEN_ERR_NOENT;
+    fill_kstat((struct eigen_kstat*)out, e);
+    return 0;
+}
+
+long sys_lstat(const char* path, void* out) { return sys_stat(path, out); }
+
+long sys_fstat(int fd, void* out) {
+    task_t* cur = get_current_task();
+    if (!cur || fd < 0 || fd >= MAX_FDS || !out) return -EIGEN_ERR_INVAL;
+    if (cur->fd_flags[fd] <= 0) return -EIGEN_ERR_INVAL;
+    fill_kstat((struct eigen_kstat*)out, cur->fd_flags[fd] - 1);
+    return 0;
+}
+
+long sys_chdir(const char* path) {
+    return fs_cd(path);          /* existing per-task cwd logic */
+}
+
+long sys_getcwd(char* buf, uint64_t size) {
+    if (!buf || !size) return -EIGEN_ERR_INVAL;
+    int n = fs_pwd(buf, (int)size);
+    return n > 0 ? (long)(uintptr_t)buf : -EIGEN_ERR_INVAL;
+}
+
+/* ioctl: terminal winsize + pgrp over ptys */
+struct winsize_k { uint16_t rows, cols, xpixel, ypixel; };
+
+long sys_ioctl(int fd, uint64_t req, void* arg) {
+    task_t* cur = get_current_task();
+    if (!cur || fd < 0 || fd >= MAX_FDS) return -EIGEN_ERR_INVAL;
+    if (cur->fd_types[fd] != FD_PTY) return -EIGEN_ERR_INVAL;
+    int idx = cur->fd_pty[fd];
+    switch (req) {
+    case 0x5413: { /* TIOCGWINSZ */
+        if (!arg) return -EIGEN_ERR_INVAL;
+        extern int pty_get_winsize(int idx, uint32_t* rows, uint32_t* cols);
+        uint32_t r = 24, c = 80;
+        pty_get_winsize(idx, &r, &c);
+        struct winsize_k* w = (struct winsize_k*)arg;
+        w->rows = (uint16_t)r; w->cols = (uint16_t)c;
+        w->xpixel = 0; w->ypixel = 0;
+        return 0; }
+    case 0x540F: { /* TIOCGPGRP */
+        extern int pty_get_fg(int idx);
+        if (!arg) return -EIGEN_ERR_INVAL;
+        *(uint32_t*)arg = (uint32_t)pty_get_fg(idx);
+        return 0; }
+    case 0x5410: /* TIOCSPGRP */
+        extern int pty_set_fg(int idx, uint32_t pid);
+        return pty_set_fg(idx, arg ? *(uint32_t*)arg : 0);
+    default:
+        return -EIGEN_ERR_INVAL;
+    }
+}
+
+long sys_access(const char* path, int mode) {
+    (void)mode;   /* F_OK/R_OK/W_OK/X_OK: existence is all we model */
+    if (!path) return -EIGEN_ERR_INVAL;
+    return fs_resolve_path(path) >= 0 ? 0 : -EIGEN_ERR_NOENT;
+}
+
+long sys_uname(void* buf) {
+    /* struct utsname: 6 x char[65] */
+    if (!buf) return -EIGEN_ERR_INVAL;
+    static const char* fields[6] = {
+        "EigenOS", "eigenos", "1.0.0-eigen",
+        "#1 EIGEN", "x86_64", ""
+    };
+    char* out = (char*)buf;
+    for (int i = 0; i < 6; i++) {
+        int j = 0;
+        while (fields[i][j] && j < 64) { out[i*65 + j] = fields[i][j]; j++; }
+        out[i*65 + j] = 0;
+    }
+    return 0;
+}
+
+/* musl struct sigaction: handler at offset 0 (union), flags at 8,
+   restorer at 16, mask at 24 (128 bytes). We only need the handler. */
+long sys_rt_sigaction(int sig, void* act, void* oact, uint64_t sigsetsize) {
+    (void)sigsetsize;
+    task_t* cur = get_current_task();
+    if (!cur || sig <= 0 || sig >= NSIG) return -EIGEN_ERR_INVAL;
+    if (oact) *(uint64_t*)oact = (uint64_t)(uintptr_t)cur->sig_handlers[sig];
+    if (act) {
+        uint64_t h = *(uint64_t*)act;
+        cur->sig_handlers[sig] = (void (*)(int))(uintptr_t)h;
+    }
+    return 0;
+}
+
+long sys_rt_sigprocmask(int how, void* set, void* oldset, uint64_t size) {
+    (void)how; (void)set;
+    if (oldset && size) memset(oldset, 0, size);   /* empty mask */
+    return 0;
+}
+
+long sys_getppid(void) {
+    task_t* cur = get_current_task();
+    return cur ? cur->ppid : 0;
+}
+
+/* days->seconds since Unix epoch for RTC wall clock (UTC-ish) */
+static uint64_t wall_seconds(void) {
+    typedef struct { int hour, minute, second, day, month, year; } rtc_time_t;
+    extern void get_time(rtc_time_t* t);
+    rtc_time_t t;
+    get_time(&t);
+    if (t.year < 2020) return 0;   /* RTC not ready */
+    static const int mdays[13] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    uint64_t days = 0;
+    for (int y = 1970; y < t.year; y++)
+        days += ((y%4==0 && y%100!=0) || y%400==0) ? 366 : 365;
+    for (int m = 1; m < t.month && m <= 12; m++) days += mdays[m];
+    if (t.month > 2 && ((t.year%4==0 && t.year%100!=0) || t.year%400==0))
+        days += 1;
+    days += t.day - 1;
+    return days*86400ULL + t.hour*3600ULL + t.minute*60ULL + t.second;
+}
+
+long sys_gettimeofday(void* tv, void* tz) {
+    (void)tz;
+    if (!tv) return 0;
+    extern uint32_t timer_get_ms(void);
+    uint64_t ms = (uint64_t)timer_get_ms();
+    uint64_t sec = ms / 1000;
+    uint64_t usec = (ms % 1000) * 1000;
+    uint64_t wsec = wall_seconds();
+    if (wsec) sec = wsec;
+    uint64_t* p = (uint64_t*)tv;
+    p[0] = sec; p[1] = usec;
+    return 0;
+}
+
+long sys_clock_gettime(int clk, void* tp) {
+    if (!tp) return 0;
+    extern uint32_t timer_get_ms(void);
+    uint64_t ms = (uint64_t)timer_get_ms();
+    uint64_t sec = ms / 1000, nsec = (ms % 1000) * 1000000;
+    if (clk == 0) { /* CLOCK_REALTIME: wall clock */
+        uint64_t wsec = wall_seconds();
+        if (wsec) sec = wsec;
+    }
+    uint64_t* p = (uint64_t*)tp;
+    p[0] = sec; p[1] = nsec;
     return 0;
 }

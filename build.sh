@@ -250,7 +250,7 @@ function build_kernel() {
 #   userui     — ring-3 UI toolkit
 
 USER_NOSTDINC="-nostdinc -I$GCC_INC"
-UCFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone -mcmodel=kernel $USER_NOSTDINC -Isrc/user/lib/libc/inc -Iinclude -Iinclude/user -Isrc/user/lib/userlib -Isrc/user/lib/userui -Isrc/user/lib/tinygl -Isrc/user/lib/freetype/include -Isrc/user/lib -Isrc/user/lib/eigenui -c"
+UCFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -fno-PIC -fcf-protection=none -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-red-zone -mcmodel=kernel $USER_NOSTDINC -Isrc/user/lib/libc/inc -Iinclude -Iinclude/user -Isrc/user/lib/userlib -Isrc/user/lib/userui -Isrc/user/lib/tinygl -Isrc/user/lib/freetype/include -Isrc/user/lib -c"
 ULDFLAGS="-nostdlib -no-pie -m elf_x86_64 -z muldefs"
 UCC="$CC"
 
@@ -270,6 +270,11 @@ function register_boot_module() {
         { print }
         index($0, "module_path: boot():/fonts/DejaVuSans.ttf") > 0 { print ins }
     ' config/limine.conf.tmp > config/limine.conf && rm -f config/limine.conf.tmp
+}
+
+function build_busybox() {
+    bash tools/build-busybox.sh || { echo "[BUSYBOX] failed"; return 1; }
+    register_boot_module "boot():/user/busybox"
 }
 
 function build_userland() {
@@ -301,15 +306,6 @@ function build_userland() {
             base=$(basename "$f" .c)
             echo "  CC lib/tinygl/$base.c -> bin/obj/user/lib/tgl_$base.o"
             $UCC $UCFLAGS "$f" -o "bin/obj/user/lib/tgl_$base.o"
-        fi
-    done
-
-    # EigenUI (modern GUI toolkit — layered EFL/Elementary-style)
-    for f in src/user/lib/eigenui/*.c; do
-        if [ -f "$f" ]; then
-            base=$(basename "$f" .c)
-            echo "  CC lib/eigenui/$base.c -> bin/obj/user/lib/eui_$base.o"
-            $UCC $UCFLAGS "$f" -o "bin/obj/user/lib/eui_$base.o"
         fi
     done
 
@@ -374,6 +370,7 @@ function build_userland() {
 
     # Folder-form ring-3 apps (multi-file, described by build.conf)
     build_folders
+    build_busybox
 }
 
 function build_zlibk() {

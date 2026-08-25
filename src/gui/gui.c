@@ -192,17 +192,13 @@ app_item_t menu_app_entries[] = {
     {"Graphing Calculator", 0, 4, 24, "graphing"},
     {"Mandelbrot", 0, 4, 6, "mandelbrot"},
     {"GLGears", 0, 4, 46, "glgears"},
-    {"GL Demos", 0, 4, 58, "gldemos"},
-    {"GLTeapot", 0, 4, 59, "glteapot"},
     {"Kernel Log", 0, 5, 27, "kernellog"},
-    {"Weather", 0, 5, 60, "weather"},
     {"Hex Viewer", 0, 5, 7, "hexdump"},
     {"On-Screen Keyboard", 0, 6, 20, "osk"},
     {"Settings", 0, 2, 98, "settings"},
     {"DOOM", 0, 3, 91, "doom"},
     {"File I/O Test", 0, 5, 93, "fiotest"},
     {"EigenDeck", 0, 2, 62, "deck"},
-    {"EigenUI Demo", 0, 1, 99, "eigenui_demo"},
     {0, 0, 0, 0}
 };
 
@@ -212,7 +208,6 @@ const char* all_items[] = {
     "Text Editor", "Mandelbrot", "Hex Viewer", "Terminal", "Process Viewer", 
     "Edrowser", "Calendar", "Clock", "Settings",
     "On-Screen Keyboard", 
-    "Image Viewer", "Bitmap Maker", "Paint Studio", "Graphing Calculator", "GLGears", "GL Demos", "GLTeapot",
     "Network Debug", "Kernel Log", 
     "Julia", "Colour Wheel",
     "Ring3 Test",
@@ -220,7 +215,6 @@ const char* all_items[] = {
     "File I/O Test",
     "DOOM",
     "DVD Bounce",
-    "EigenUI Demo",
     0
 };
 

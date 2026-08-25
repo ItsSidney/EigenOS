@@ -60,9 +60,12 @@
 #define SM_ITEM_H        25
 #define SM_MAX_ROWS      11
 
-/* ── grid launcher (Super+S search) metrics ────────────────── */
-#define LAUNCHER_MARGIN  8
-#define LAUNCHER_HEAD_H  54
+/* ── compact Super+S search (single-column list) metrics ────── */
+#define LAUNCHER_MARGIN    8
+#define LAUNCHER_HEAD_H    42
+#define LAUNCHER_ROW_H     30
+#define LAUNCHER_MAX_ROWS  10
+/* legacy grid metrics retained to keep struct consumers valid */
 #define LAUNCHER_SIDE_W  148
 #define LAUNCHER_FOOT_H  30
 #define CARD_W           150
@@ -338,21 +341,16 @@ static void lc_geom(lc_geom_t* g) {
     uint32_t fw = get_fb_width(), fh = get_fb_height();
     tb_geom_t t; tb_geom(&t);
     g->w = (int)fw - 2 * LAUNCHER_MARGIN;
-    if (g->w > 760) g->w = 760;
-    g->h = (int)fh - t.bar_h - LAUNCHER_MARGIN - 12;
-    if (g->h > 500) g->h = 500;
-    g->x = LAUNCHER_MARGIN;
+    if (g->w > 340) g->w = 340;
+    int vis = g_nfiltered;
+    if (vis > LAUNCHER_MAX_ROWS) vis = LAUNCHER_MAX_ROWS;
+    if (vis < 1) vis = 1;                  /* keep panel open for "no results" */
+    g->h = LAUNCHER_HEAD_H + vis * LAUNCHER_ROW_H + 2;
+    g->x = (int)fw / 2 - g->w / 2;         /* centered */
     g->y = t.bar_h + 6;
-    g->side_x = g->x + 10;
-    g->side_y = g->y + LAUNCHER_HEAD_H + 6;
-    g->side_w = LAUNCHER_SIDE_W;
-    g->grid_x = g->side_x + g->side_w + 10;
-    g->grid_y = g->side_y;
-    g->grid_w = g->x + g->w - g->grid_x - 14;
-    g->foot_y = g->y + g->h - LAUNCHER_FOOT_H;
-    g->grid_h = g->foot_y - 6 - g->grid_y;
-    g->cols = (g->grid_w + CARD_GAP) / (CARD_W + CARD_GAP);
-    if (g->cols < 1) g->cols = 1;
+    g->side_x = g->x; g->side_y = g->y; g->side_w = 0;
+    g->grid_x = g->x; g->grid_y = g->y; g->grid_w = g->w; g->grid_h = g->h;
+    g->foot_y = g->y + g->h; g->cols = 1;
 }
 
 /* ── cascade menu geometry ─────────────────────────────────── */
@@ -652,6 +650,7 @@ static void draw_window_buttons(const tb_geom_t* t) {
         int wx = xs[i], bw = ws_[i];
         wm_window_t* win = sl[i].win;
         int is_static = sl[i].is_static;
+        if (!is_static && !win) continue;   /* window died mid-frame */
         int is_focus  = win && (win->id == focused);
         int hovr      = pir(mx, my, wx, 0, bw, t->bar_h);
 
@@ -959,120 +958,77 @@ static void draw_launcher(void) {
     lc_geom_t L; lc_geom(&L);
     uint32_t panel = theme_get_color(THEME_ROLE_MENU_BG);
     uint32_t border = theme_get_color(THEME_ROLE_OUTLINE);
-    uint32_t txt = theme_get_color(THEME_ROLE_PRIMARY);
-    uint32_t mut = theme_get_color(THEME_ROLE_SECONDARY);
-    uint32_t hov = theme_get_color(THEME_ROLE_MENU_ITEM_HOVER);
-    uint32_t selc = theme_get_color(THEME_ROLE_MENU_ITEM_SELECTED);
-    uint32_t acc = get_accent_color();
+    uint32_t txt   = theme_get_color(THEME_ROLE_PRIMARY);
+    uint32_t mut   = theme_get_color(THEME_ROLE_SECONDARY);
+    uint32_t hov   = theme_get_color(THEME_ROLE_MENU_ITEM_HOVER);
+    uint32_t selc  = theme_get_color(THEME_ROLE_MENU_ITEM_SELECTED);
+    uint32_t acc   = get_accent_color();
     int mx = mouse_get_x(), my = mouse_get_y();
 
     /* slide-in animation (120 ms) */
     int slide = 0;
     uint32_t dt = timer_get_ms() - g_open_ms;
     if (dt < 120) slide = (int)(12 * (120 - dt) / 120);
-    int ox = 0, oy = -slide;
+    int oy = -slide;
 
-    gfx_draw_shadow(L.x, L.y, L.w, L.h, 14);
+    gfx_draw_shadow(L.x, L.y, L.w, L.h, 10);
     gfx_fill_rect(L.x, L.y + oy, L.w, L.h, panel);
     gfx_draw_rect_outline(L.x, L.y + oy, L.w, L.h, 1, border);
 
-    /* ── header: search field ── */
-    int sf_x = L.x + 12, sf_y = L.y + oy + 12;
-    int sf_w = L.w - 24, sf_h = LAUNCHER_HEAD_H - 22;
-    gfx_fill_rect(sf_x, sf_y, sf_w, sf_h,
-                  theme_get_color(THEME_ROLE_SURFACE_VARIANT));
-    gfx_draw_rect_outline(sf_x, sf_y, sf_w, sf_h, 1,
-                          g_qlen > 0 ? acc : border);
-    draw_search_icon(sf_x + 10, sf_y + (sf_h - 20) / 2, 20, 20);
-    if (g_qlen > 0) {
-        ttext(sf_x + 40, sf_y + (sf_h - tlh(14)) / 2 + 1, g_q, txt, 14);
-    } else {
-        ttext(sf_x + 40, sf_y + (sf_h - tlh(14)) / 2 + 1, "Search apps...", mut, 14);
-    }
-    /* caret blink */
+    /* ── search field ── */
+    int sf_x = L.x + 10, sf_y = L.y + oy + 8;
+    int sf_w = L.w - 20, sf_h = LAUNCHER_HEAD_H - 16;
+    gfx_fill_rect(sf_x, sf_y, sf_w, sf_h, theme_get_color(THEME_ROLE_SURFACE_VARIANT));
+    gfx_draw_rect_outline(sf_x, sf_y, sf_w, sf_h, 1, g_qlen > 0 ? acc : border);
+    draw_search_icon(sf_x + 8, sf_y + (sf_h - 16) / 2, 16, 16);
+    int tx = sf_x + 30;
+    if (g_qlen > 0)
+        ttext(tx, sf_y + (sf_h - tlh(13)) / 2 + 1, g_q, txt, 13);
+    else
+        ttext(tx, sf_y + (sf_h - tlh(13)) / 2 + 1, "Search apps...", mut, 13);
     if ((timer_get_ms() / 500) % 2 == 0) {
-        int cxp = sf_x + 40 + twidth(g_q, 14) + 2;
-        gfx_fill_rect(cxp, sf_y + 8, 2, sf_h - 16, acc);
+        int cxp = tx + twidth(g_q, 13) + 2;
+        gfx_fill_rect(cxp, sf_y + 6, 2, sf_h - 12, acc);
     }
 
-    /* ── sidebar categories ── */
-    int cat_counts_[8] = { 0 };
-    for (int i = 0; menu_app_entries[i].name != 0; i++) {
-        cat_counts_[0]++;
-        if (menu_app_entries[i].category >= 1 && menu_app_entries[i].category <= 7)
-            cat_counts_[menu_app_entries[i].category]++;
-    }
-    for (int c = 0; c < 8; c++) {
-        int cy = L.side_y + c * 32;
-        if (cy + 28 > L.foot_y) break;
-        int hovr = pir(mx, my, L.side_x, cy, L.side_w, 28);
-        if (c == g_cat)
-            gfx_fill_rect(L.side_x, cy + oy, L.side_w, 28, selc);
-        else if (hovr)
-            gfx_fill_rect(L.side_x, cy + oy, L.side_w, 28, hov);
-        ttext_trunc(L.side_x + 12, cy + oy + (28 - tlh(13)) / 2 + 1,
-                    L.side_w - 38, tb_cat_names[c],
-                    c == g_cat ? 0xFFFFFF : (hovr ? txt : mut), 13);
-        char cnt[8];
-        cnt[0] = 0;
-        snprintf(cnt, sizeof(cnt), "%d", cat_counts_[c]);
-        int cwd = twidth(cnt, 11);
-        ttext(L.side_x + L.side_w - cwd - 10, cy + oy + (28 - tlh(11)) / 2 + 1,
-              cnt, mut, 11);
-    }
-
-    /* ── grid cards ── */
-    int rows = (g_nfiltered + L.cols - 1) / L.cols;
-    int rows_vis = L.grid_h / (CARD_H + CARD_GAP);
-    if (rows_vis < 1) rows_vis = 1;
-    if (g_scroll > rows - rows_vis) g_scroll = rows - rows_vis;
+    /* ── result list (single column) ── */
+    int list_y = L.y + oy + LAUNCHER_HEAD_H;
+    int list_h = L.h - LAUNCHER_HEAD_H - 2;
+    int vis = list_h / LAUNCHER_ROW_H;
+    if (vis < 1) vis = 1;
+    if (g_scroll > g_nfiltered - vis) g_scroll = g_nfiltered - vis;
     if (g_scroll < 0) g_scroll = 0;
 
-    gfx_push_clip(L.grid_x, L.grid_y + oy, L.grid_w, L.grid_h);
+    gfx_push_clip(L.x, list_y, L.w, list_h);
+    if (g_nfiltered == 0) {
+        ttext(L.x + 14, list_y + (LAUNCHER_ROW_H - tlh(12)) / 2, "No results", mut, 12);
+    }
     for (int vi = 0; vi < g_nfiltered; vi++) {
-        int idx = vi - g_scroll * L.cols;
-        if (idx < 0) continue;
-        int r = idx / L.cols, col = idx % L.cols;
-        if (r >= rows_vis) continue;
-        int cx = L.grid_x + col * (CARD_W + CARD_GAP);
-        int cy = L.grid_y + r * (CARD_H + CARD_GAP);
-        app_item_t* app = &menu_app_entries[g_filtered[vi]];
-
-        int hovr = pir(mx, my, cx, cy, CARD_W, CARD_H);
+        if (vi < g_scroll) continue;
+        int rr = vi - g_scroll;
+        if (rr >= vis) break;
+        int ry = list_y + rr * LAUNCHER_ROW_H;
+        int hovr = pir(mx, my, L.x, ry, L.w, LAUNCHER_ROW_H);
         int ksel = (vi == g_sel);
-        if (ksel || hovr) {
-            gfx_fill_rect(cx, cy + oy, CARD_W, CARD_H, hov);
-            if (ksel) gfx_draw_rect_outline(cx, cy + oy, CARD_W, CARD_H, 2, acc);
-            else gfx_draw_rect_outline(cx, cy + oy, CARD_W, CARD_H, 1, border);
-        }
-        draw_app_icon_tile(app->name, cx + 10, cy + oy + (CARD_H - 44) / 2, 44,
-                           ksel ? 2 : 0, acc);
-        ttext_trunc(cx + 62, cy + oy + (CARD_H - tlh(13)) / 2 + 1,
-                    CARD_W - 70, app->name, hovr ? txt : (ksel ? txt : theme_get_color(THEME_ROLE_PRIMARY)), 13);
+        if (ksel)       gfx_fill_rect(L.x, ry, L.w, LAUNCHER_ROW_H, selc);
+        else if (hovr)  gfx_fill_rect(L.x, ry, L.w, LAUNCHER_ROW_H, hov);
+        draw_app_icon_tile(menu_app_entries[g_filtered[vi]].name,
+                           L.x + 12, ry + (LAUNCHER_ROW_H - 22) / 2, 22, ksel ? 2 : 0, acc);
+        ttext_trunc(L.x + 42, ry + (LAUNCHER_ROW_H - tlh(13)) / 2 + 1,
+                    L.w - 52, menu_app_entries[g_filtered[vi]].name,
+                    ksel ? 0xFFFFFF : txt, 13);
     }
     gfx_pop_clip();
 
-    /* scrollbar */
-    if (rows > rows_vis) {
-        int sb_x = L.x + L.w - 8;
-        int sb_y = L.grid_y + oy;
-        int sb_h = L.grid_h;
-        gfx_fill_rect(sb_x, sb_y, 4, sb_h, theme_get_color(THEME_ROLE_SCROLLBAR));
-        int thumb_h = sb_h * rows_vis / rows;
-        int thumb_y = sb_y + sb_h * g_scroll / rows;
-        gfx_fill_rect(sb_x, thumb_y, 4, thumb_h, acc);
+    /* thin scrollbar when overflowing */
+    if (g_nfiltered > vis) {
+        int sb_x = L.x + L.w - 4;
+        int sb_y = list_y, sb_h = vis * LAUNCHER_ROW_H;
+        gfx_fill_rect(sb_x, sb_y, 3, sb_h, theme_get_color(THEME_ROLE_SCROLLBAR));
+        int thumb_h = sb_h * vis / g_nfiltered;
+        int thumb_y = sb_y + sb_h * g_scroll / g_nfiltered;
+        gfx_fill_rect(sb_x, thumb_y, 3, thumb_h, acc);
     }
-
-    /* ── footer ── */
-    gfx_draw_hline(L.x, L.foot_y + oy, L.w, border);
-    char foot[96];
-    snprintf(foot, sizeof(foot), "%d apps", g_nfiltered);
-    ttext(L.x + 12, L.foot_y + oy + (LAUNCHER_FOOT_H - tlh(11)) / 2 + 1,
-          foot, mut, 11);
-    const char* hint = "Enter launch   Esc close   type to search";
-    int hw = twidth(hint, 11);
-    ttext(L.x + L.w - hw - 12, L.foot_y + oy + (LAUNCHER_FOOT_H - tlh(11)) / 2 + 1,
-          hint, mut, 11);
 }
 
 /* ═══════════════════════ BAR RENDER ════════════════════════ */
@@ -1191,7 +1147,7 @@ void draw_taskbar_mac(void) {
         if (wd != 0) {
             mouse_clear_wheel_delta();
             lc_geom_t Lc; lc_geom(&Lc);
-            int rows_vis = Lc.grid_h / (CARD_H + CARD_GAP);
+            int rows_vis = (Lc.h - LAUNCHER_HEAD_H - 2) / LAUNCHER_ROW_H;
             if (rows_vis < 1) rows_vis = 1;
             g_scroll += (wd > 0 ? -rows_vis : rows_vis);
             if (g_scroll < 0) g_scroll = 0;
@@ -1338,7 +1294,7 @@ int taskbar_handle_click(int cx, int cy, int clicked, int rclicked) {
         return 1;
     }
 
-    /* ── searchable grid launcher ── */
+    /* ── compact Super+S search ── */
     if (g_launcher) {
         lc_geom_t L;
         lc_geom(&L);
@@ -1350,29 +1306,21 @@ int taskbar_handle_click(int cx, int cy, int clicked, int rclicked) {
         }
 
         if (in_panel) {
-            for (int c = 0; c < 8; c++) {
-                int cy2 = L.side_y + c * 32;
-                if (pir(cx, cy, L.side_x, cy2, L.side_w, 28)) {
-                    if (g_cat != c) { g_cat = c; g_scroll = 0; g_sel = -1; refilter(); }
-                    return 1;
-                }
-            }
-            refilter();
-            int rows_vis = L.grid_h / (CARD_H + CARD_GAP);
-            if (rows_vis < 1) rows_vis = 1;
+            int list_y = L.y + LAUNCHER_HEAD_H;
+            int vis = (L.h - LAUNCHER_HEAD_H - 2) / LAUNCHER_ROW_H;
+            if (vis < 1) vis = 1;
             for (int vi = 0; vi < g_nfiltered; vi++) {
-                int idx = vi - g_scroll * L.cols;
-                if (idx < 0) continue;
-                int r = idx / L.cols, col = idx % L.cols;
-                if (r >= rows_vis) continue;
-                int ccx = L.grid_x + col * (CARD_W + CARD_GAP);
-                int ccy = L.grid_y + r * (CARD_H + CARD_GAP);
-                if (pir(cx, cy, ccx, ccy, CARD_W, CARD_H)) {
+                if (vi < g_scroll) continue;
+                int rr = vi - g_scroll;
+                if (rr >= vis) break;
+                int ry = list_y + rr * LAUNCHER_ROW_H;
+                if (pir(cx, cy, L.x, ry, L.w, LAUNCHER_ROW_H)) {
+                    g_sel = vi;
                     launch_grid_item(vi);
                     return 1;
                 }
             }
-            return 1;
+            return 1;   /* clicks inside the panel are consumed */
         }
     }
 
@@ -1535,7 +1483,7 @@ int taskbar_handle_key(char key_in) {
 
     if (!g_launcher) return 0;
 
-    /* ── searchable grid launcher ── */
+    /* ── compact Super+S search ── */
     if (KEY_MATCH(key, KEY_ESC)) { taskbar_launcher_close(); return 1; }
 
     if (KEY_MATCH(key, '\b')) {
@@ -1549,15 +1497,13 @@ int taskbar_handle_key(char key_in) {
         return 1;
     }
 
-    if (KEY_MATCH(key, KEY_DOWN)) { if (g_sel < g_nfiltered - 1) g_sel++; return 1; }
-    if (KEY_MATCH(key, KEY_UP))   { if (g_sel > 0) g_sel--; return 1; }
-    if (KEY_MATCH(key, KEY_LEFT)) { if (g_sel > 0) { g_sel--; } else if (g_nfiltered) g_sel = g_nfiltered - 1; return 1; }
-    if (KEY_MATCH(key, KEY_RIGHT)) { if (g_sel < g_nfiltered - 1) g_sel++; else g_sel = 0; return 1; }
+    if (KEY_MATCH(key, KEY_DOWN)) { if (g_sel < g_nfiltered - 1) g_sel++; if (g_sel - g_scroll >= LAUNCHER_MAX_ROWS) g_scroll++; return 1; }
+    if (KEY_MATCH(key, KEY_UP))   { if (g_sel > 0) g_sel--; if (g_sel < g_scroll) g_scroll = g_sel; return 1; }
 
     lc_geom_t L; lc_geom(&L);
-    int rows_vis = L.grid_h / (CARD_H + CARD_GAP);
+    int rows_vis = (L.h - LAUNCHER_HEAD_H - 2) / LAUNCHER_ROW_H;
     if (rows_vis < 1) rows_vis = 1;
-    if (KEY_MATCH(key, KEY_PAGE_DOWN)) { g_scroll += rows_vis; g_sel = -1; return 1; }
+    if (KEY_MATCH(key, KEY_PAGE_DOWN)) { g_scroll += rows_vis; if (g_scroll > g_nfiltered - rows_vis) g_scroll = g_nfiltered - rows_vis; if (g_scroll < 0) g_scroll = 0; g_sel = -1; return 1; }
     if (KEY_MATCH(key, KEY_PAGE_UP))   { g_scroll -= rows_vis; if (g_scroll < 0) g_scroll = 0; g_sel = -1; return 1; }
 
     if (key >= 32 && key <= 126 && g_qlen < 62) {

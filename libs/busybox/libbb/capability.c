@@ -1,21 +1,9 @@
-/*
- * Copyright (C) 2017 by  <assafgordon@gmail.com>
- *
- * Licensed under GPLv2 or later, see file LICENSE in this source tree.
- */
-//kbuild:lib-$(CONFIG_FEATURE_SETPRIV_CAPABILITIES) += capability.o
-//kbuild:lib-$(CONFIG_RUN_INIT) += capability.o
-
-#include <linux/capability.h>
-// #include <sys/capability.h>
-// This header is in libcap, but the functions are in libc.
-// Comment in the header says this above capset/capget:
-/* system calls - look to libc for function to system call mapping */
-extern int capset(cap_user_header_t header, cap_user_data_t data);
-extern int capget(cap_user_header_t header, const cap_user_data_t data);
-// so for bbox, let's just repeat the declarations.
-// This way, libcap needs not be installed in build environment.
+/* EigenOS port: capabilities unsupported. All entry points no-op.
+   Callers are config-disabled (CONFIG_FEATURE_SETPRIV=n); this TU only
+   exists because libbb compiles unconditionally. */
 #include "libbb.h"
+#include <linux/capability.h>
+DEFINE_STRUCT_CAPS;
 
 static const char *const capabilities[] ALIGN_PTR = {
 	"chown",
@@ -57,6 +45,10 @@ static const char *const capabilities[] ALIGN_PTR = {
 	"block_suspend",
 	"audit_read",
 };
+long capget(void* hdr, void* data) { (void)hdr; (void)data; return -1; }
+long capset(void* hdr, const void* data) { (void)hdr; (void)data; return -1; }
+const char* cap_num_to_name(unsigned num) { (void)num; return 0; }
+int drop_capabilities(void) { return 0; }
 
 unsigned FAST_FUNC cap_name_to_number(const char *cap)
 {
@@ -77,17 +69,6 @@ unsigned FAST_FUNC cap_name_to_number(const char *cap)
 		bb_error_msg_and_die("unknown capability '%s'", cap);
 	return i;
 }
-
-void FAST_FUNC printf_cap(const char *pfx, unsigned cap_no)
-{
-	if (cap_no < ARRAY_SIZE(capabilities)) {
-		printf("%s%s", pfx, capabilities[cap_no]);
-		return;
-	}
-	printf("%scap_%u", pfx, cap_no);
-}
-
-DEFINE_STRUCT_CAPS;
 
 void FAST_FUNC getcaps(void *arg)
 {

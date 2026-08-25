@@ -198,10 +198,14 @@ static void vt_feed(const char* s, int n) {
 /* rendering                                                            */
 static void draw_row_cells(int px, int py, cell_t* r) {
     static char rowbuf[COLS+1];
+    /* clip to the live window: resized buffers are smaller than the grid */
+    int max_cols = (cur_w - 8) / CHAR_W;
+    if (max_cols < 0) max_cols = 0;
+    if (max_cols > COLS) max_cols = COLS;
     int sx = 0;
-    while (sx < COLS) {
+    while (sx < max_cols) {
         int ex = sx;
-        while (ex < COLS && r[ex].fg == r[sx].fg && r[ex].bg == r[sx].bg) ex++;
+        while (ex < max_cols && r[ex].fg == r[sx].fg && r[ex].bg == r[sx].bg) ex++;
         int len = ex - sx;
         int k; for (k = 0; k < len; k++) rowbuf[k] = r[sx+k].ch;
         rowbuf[k] = 0;
@@ -225,15 +229,16 @@ static void render_screen(void) {
     int live_vis = view_rows - sb_view;
 
     int py = pad;
+    int max_rows = (cur_h - pad) / G_LINE;
     /* scrollback slice (oldest at top) */
-    for (int i = sb_view; i > 0; i--, py += G_LINE) {
+    for (int i = sb_view; i > 0 && py < max_rows*G_LINE + pad; i--, py += G_LINE) {
         int idx = (sb_head - i + SB_LINES*2) % SB_LINES;
         if (!sb[idx]) continue;
         draw_row_cells(pad, py, sb[idx]);
     }
     /* live grid: bottom `live_vis` rows */
     int g0 = ROWS - live_vis;
-    for (int gr = g0; gr < ROWS; gr++, py += G_LINE)
+    for (int gr = g0; gr < ROWS && py < max_rows*G_LINE + pad; gr++, py += G_LINE)
         draw_row_cells(pad, py, grid[gr]);
 
     /* cursor */
@@ -241,10 +246,12 @@ static void render_screen(void) {
         static uint32_t blink_t = 0;
         uint32_t now = eigen_gettime_ms();
         if (now - blink_t > 500) { blink_vis ^= 1; blink_t = now; }
-        if (blink_vis && cy >= g0)
+        int cuy = pad + sb_view*G_LINE + (cy-g0)*G_LINE;
+        if (blink_vis && cy >= g0 && cuy >= 0 &&
+            cuy + G_LINE <= cur_h &&
+            pad + cx*CHAR_W + CHAR_W <= cur_w)
             eigen_draw_fillrect(win_fb, cur_w, cur_h, pad + cx*CHAR_W,
-                                pad + sb_view*G_LINE + (cy-g0)*G_LINE,
-                                CHAR_W, G_LINE-1, 0x88C0D0);
+                                cuy, CHAR_W, G_LINE-1, 0x88C0D0);
     }
     eigen_win_flush(win_id);
 }
@@ -264,8 +271,6 @@ static void spawn_shell(void) {
       write(1, dbg, dn); }
     if (sh_pid > 0) {
         eigen_pty_setfg(mfd, sh_pid);
-        const char* banner = "\x1b[36mEigenOS shell\x1b[0m\r\n";
-        vt_feed(banner, (int)strlen(banner));
     } else {
         const char* err = "spawn /user/sh.elf failed\r\n";
         vt_feed(err, (int)strlen(err));
@@ -277,29 +282,30 @@ static void spawn_shell(void) {
 
 static void send_key(eigen_ev_t* ev) {
     if (mfd < 0) return;
-    char seq[8];
-    int code = ev->b, mods = ev->c;
-    char ch = (char)ev->a;
+    /* Event model: a = ASCII char (or KEY_* 128+), releases carry 0x100.
+       b is always 0 from the WM — do NOT switch on scancodes here. */
+    int key = ev->a;
+    if (key & 0x100) return;                 /* key release */
+    int mods = ev->c;
+    char ch = (char)(key & 0xFF);
 
-    if ((mods & 2)) {                     /* ctrl */
+    if (mods & 2) {                          /* ctrl */
         if (ch=='c'||ch=='C'){ write(mfd,"\x03",1); return; }
         if (ch=='d'||ch=='D'){ write(mfd,"\x04",1); return; }
         if (ch=='u'||ch=='U'){ write(mfd,"\x15",1); return; }
         if (ch=='l'||ch=='L'){ write(mfd,"\x0c",1); return; }
     }
-    switch (code) {
-    case 0x48: write(mfd, "\x1b[A", 3); return;  /* up */
-    case 0x50: write(mfd, "\x1b[B", 3); return;  /* down */
-    case 0x4B: write(mfd, "\x1b[D", 3); return;  /* left */
-    case 0x4D: write(mfd, "\x1b[C", 3); return;  /* right */
-    case 0x0E: write(mfd, "\x7f", 1);   return;  /* backspace */
-    case 0x1C: write(mfd, "\r", 1);     return;  /* enter */
-    case 0x39: write(mfd, " ", 1);      return;  /* space */
-    case 0x49: if (sb_off < sb_count) sb_off += 10; return;
-    case 0x51: sb_off -= 10; if (sb_off < 0) sb_off = 0; return;
+    switch (key) {
+    case '\n': case '\r': write(mfd, "\r", 1);   return;  /* Enter */
+    case '\b': case 0x7F: write(mfd, "\x7f", 1);  return;  /* Backspace */
+    case '\t':            write(mfd, "\t", 1);    return;
+    case 128: write(mfd, "\x1b[A", 3); return;   /* up */
+    case 129: write(mfd, "\x1b[B", 3); return;   /* down */
+    case 130: write(mfd, "\x1b[D", 3); return;   /* left */
+    case 131: write(mfd, "\x1b[C", 3); return;   /* right */
     default: break;
     }
-    if (ch >= 32 && ch < 127) { seq[0]=ch; write(mfd, seq, 1); }
+    if (ch >= 32 && ch < 127) { char c0 = ch; write(mfd, &c0, 1); }
 }
 
 int main(int argc, char* argv[]) {
@@ -313,7 +319,12 @@ int main(int argc, char* argv[]) {
         grid[r][c].ch=' ';grid[r][c].fg=FG_DEF;grid[r][c].bg=BG_DEF;}
 
     spawn_shell();
+    { char m[96]; int n = snprintf(m,sizeof(m),
+        "[TERM] post-spawn m=%d sh=%d grid0='%.8s'\n",
+        mfd, sh_pid, &grid[0][0].ch);
+      write(1, m, n); }
 
+    { const char* m = "[TERM] loop start\n"; write(1, m, 18); }
     char rbuf[256];
     eigen_ev_t evs[8];
     int running = 1;
@@ -329,7 +340,17 @@ int main(int argc, char* argv[]) {
 
         if (mfd >= 0) {
             int got = read(mfd, rbuf, sizeof(rbuf));
-            if (got > 0) vt_feed(rbuf, got);
+            if (got > 0) {
+                static int first_dump = 0;
+                if (!first_dump) {
+                    first_dump = 1;
+                    char m[80]; int n = snprintf(m,sizeof(m),
+                        "[TERM] first read got=%d '%c%c%c'\n",
+                        got, rbuf[0], got>1?rbuf[1]:0, got>2?rbuf[2]:0);
+                    write(1, m, n);
+                }
+                vt_feed(rbuf, got);
+            }
         }
 
         render_screen();

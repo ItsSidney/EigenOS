@@ -64,6 +64,7 @@ int fs_truncate(const char* filename);
 int get_user_dir();
 int fs_get_node(int idx, char* name, int* size, int* type, int* parent, uint8_t* flags, uint32_t* mod_time);
 int fs_get_current_dir();
+int fs_resolve_path(const char* path);
 int fs_set_flags(const char* filename, uint8_t flags);
 
 /* Create a directory and any missing parents (e.g. "home/user/X"). Returns the

@@ -1,19 +1,30 @@
 /***************************************************************/
-/* EigenOS filesystem — simple, reproducible, Linux-shaped.    */
-/*                                                             */
-/* MODEL                                                        */
-/*   Node table: files[MAX_FILES], node 0 is always "/".        */
-/*   Every node has parent_dir; directories own children by     */
-/*   scanning the table (slot order = stable readdir order).    */
-/*   Slot index doubles as the inode number for getdents64.     */
-/*                                                              */
-/* LAYOUT seeded at init (FHS-flavored):                        */
-/*   /bin /user /dev /tmp /etc /proc /home/eigen/{Desktop,...}  */
-/*                                                              */
-/* PATHS: one resolver, fs_resolve(). Per-task cwd lives in     */
-/* task_t.cwd_node (kernel side); "." and ".." are honored.     */
-/*                                                             */
-/* Copyright (C) Sidney 2024-2026. All rights reserved.         */
+/* EigenOS filesystem — a small, predictable, Linux-flavoured RAM FS.  */
+/*                                                                     */
+/* HOW IT IS LAID OUT                                                  */
+/*   Everything is a node in files[MAX_FILES]. Slot 0 is always "/".    */
+/*   A directory owns its children purely by their parent_dir slot,     */
+/*   so slot order doubles as a stable readdir order and the slot       */
+/*   number itself serves as the inode number for getdents64.           */
+/*                                                                     */
+/* PATHS                                                               */
+/*   One resolver (fs_resolve_impl) handles absolute and relative       */
+/*   paths, "." and "..". Each task carries its own working directory   */
+/*   (task_t.cwd_node) so chdir in one process never leaks into         */
+/*   another — fork() copies it, execve() keeps it.                     */
+/*                                                                     */
+/* LAYOUT AT BOOT                                                       */
+/*   /bin /user /cfg /etc /tmp /proc /dev/{null,zero,console,tty}       */
+/*   /home/eigen/{Desktop,.Trash}  — boot modules land in /user.        */
+/*                                                                     */
+/* PERSISTENCE                                                          */
+/*   persist.c snapshots the node table verbatim; external nodes        */
+/*   (capacity==0, e.g. /user/*.elf aliased straight to Limine module   */
+/*   memory) are recorded as metadata only, never copied.               */
+/*                                                                     */
+/* Copyright (C) Sidney 2024-2026. All rights reserved.                 */
+/* Written by Sidney.                                                   */
+/* Distributed under terms of the GNU General Public License.           */
 /***************************************************************/
 
 #include <filesystem/filesystem.h>
@@ -144,7 +155,7 @@ int ensure_dir_chain(const char* path) {                /* "a/b/c" from root */
 /* ------------------------------------------------------------------ */
 /* THE path resolver — every public API goes through here.            */
 /*                                                                    */
-/* fs_resolve(path, cwd):                                             */
+/* fs_resolve_impl(path, cwd):                                             */
 /*   returns node index of the FINAL component, or -1 (ENOENT).       */
 /* fs_resolve_parent(path, cwd, out_leaf):                            */
 /*   returns parent dir index, copies final component into out_leaf.  */
@@ -196,7 +207,7 @@ static int walk(int dir, const char* p, int* out_is_final_dir,
     return dir;
 }
 
-static int fs_resolve(const char* path) {
+static int fs_resolve_impl(const char* path) {
     if (!path || !path[0]) return 0;
     int start = (path[0] == '/') ? 0 : task_cwd();
     int isfinal = 0;
@@ -206,6 +217,9 @@ static int fs_resolve(const char* path) {
     return r;
 }
 
+
+/* exported for kernel callers (sys_stat/access) */
+int fs_resolve_path(const char* path) { return fs_resolve_impl(path); }
 
 static int fs_resolve_parent(const char* path, char* leaf, int leaf_cap) {
     if (!path || !path[0]) return -1;
@@ -270,7 +284,7 @@ int fs_find_child(int dir_idx, int child_idx) {
 /* ------------------------------------------------------------------ */
 /* fd-less metadata ops                                                */
 /* ------------------------------------------------------------------ */
-int fs_exists(const char* filename) { return fs_resolve(filename) >= 0; }
+int fs_exists(const char* filename) { return fs_resolve_impl(filename) >= 0; }
 
 int fs_mkdir(const char* path) {
     char leaf[MAX_FILENAME];
@@ -281,7 +295,7 @@ int fs_mkdir(const char* path) {
 
 int fs_create(const char* filename) {
     /* exists already? open-style success keeps legacy callers happy */
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e >= 0) return e;
     char leaf[MAX_FILENAME];
     int parent = fs_resolve_parent(filename, leaf, sizeof(leaf));
@@ -295,7 +309,7 @@ int fs_create(const char* filename) {
 }
 
 int fs_touch(const char* filename) {
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e >= 0) { now_stamp(&files[e]); return e; }
     return fs_create(filename);
 }
@@ -326,13 +340,13 @@ static int delete_recursive(int idx) {
 }
 
 int fs_delete(const char* filename) {
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e <= 0) return -1;                    /* no deleting "/" */
     return delete_recursive(e);
 }
 
 int fs_rmdir(const char* path) {
-    int e = fs_resolve(path);
+    int e = fs_resolve_impl(path);
     if (e <= 0) return -1;
     if (files[e].type != FS_DIRECTORY) return -1;
     if (!fs_is_directory_empty(e)) return -1; /* rmdir: must be empty */
@@ -341,7 +355,7 @@ int fs_rmdir(const char* path) {
 }
 
 int fs_truncate(const char* filename) {
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e < 0) return -1;
     file_t* f = &files[e];
     if (f->type != FS_FILE) return -1;
@@ -354,7 +368,7 @@ int fs_truncate(const char* filename) {
 }
 
 int fs_rename(const char* oldname, const char* newname) {
-    int e = fs_resolve(oldname);
+    int e = fs_resolve_impl(oldname);
     if (e <= 0) return -1;
     char leaf[MAX_FILENAME];
     int parent = fs_resolve_parent(newname, leaf, sizeof(leaf));
@@ -370,9 +384,9 @@ int fs_rename(const char* oldname, const char* newname) {
 int fs_move(const char* src, const char* dst) { return fs_rename(src, dst); }
 
 int fs_copy_file(const char* src_name, const char* dst_name) {
-    int s = fs_resolve(src_name);
+    int s = fs_resolve_impl(src_name);
     if (s < 0 || files[s].type != FS_FILE) return -1;
-    int d = fs_resolve(dst_name);
+    int d = fs_resolve_impl(dst_name);
     if (d >= 0 && files[d].type == FS_DIRECTORY) {
         /* copy INTO directory keeping basename */
         d = create_entry(files[s].name, FS_FILE, d, files[s].flags);
@@ -424,7 +438,7 @@ int fs_copy_file_to_dir(int src_dir, const char* src_name,
 /* ------------------------------------------------------------------ */
 int fs_trash_file(const char* filename) {
     if (trash_dir_index < 0) return -1;
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e <= 0) return -1;
     char leaf[MAX_FILENAME];
     strncpy(leaf, files[e].name, MAX_FILENAME-1);
@@ -492,7 +506,7 @@ static int file_owns_data(const file_t* f) { return f->capacity > 0; }
 
 int fs_open(const char* filename, int flags) {
     (void)flags;
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e >= 0) {
         if (files[e].type == FS_DIRECTORY) return e;   /* dirs openable (getdents) */
         return e;
@@ -532,7 +546,7 @@ int fs_write(int fd, const char* buf, int count) {
 int fs_close(int fd) { (void)fd; return 0; }
 
 int fs_cat(const char* filename, char* output, int max_len) {
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e < 0 || files[e].type != FS_FILE) return -1;
     int n = files[e].size < max_len-1 ? files[e].size : max_len-1;
     if (n > 0 && files[e].data) memcpy(output, files[e].data, (size_t)n);
@@ -567,7 +581,7 @@ int fs_cd(const char* dirname) {
         ktask_set_cwd(0);
         return 0;
     }
-    int e = fs_resolve(dirname);
+    int e = fs_resolve_impl(dirname);
     if (e < 0 || files[e].type != FS_DIRECTORY) return -1;
     extern int ktask_set_cwd(int);
     return ktask_set_cwd(e);
@@ -616,7 +630,7 @@ void fs_format_time(uint32_t ms, char* out, int max_len) {
 }
 
 int fs_set_flags(const char* filename, uint8_t flags) {
-    int e = fs_resolve(filename);
+    int e = fs_resolve_impl(filename);
     if (e < 0) return -1;
     files[e].flags = flags;
     return 0;
@@ -654,6 +668,38 @@ void init_filesystem(void) {
     if (ensure_dir_chain("proc") < 0) {}
     if (ensure_dir_chain("dev/null") < 0) {}
     if (ensure_dir_chain("dev/zero") < 0) {}
+    if (ensure_dir_chain("dev/console") < 0) {}
+    if (ensure_dir_chain("dev/tty") < 0) {}
+    if (ensure_dir_chain("etc") < 0) {}
+    /* seed /etc/passwd + /etc/group once (id/whoami/login applets) */
+    if (fs_resolve_impl("/etc/passwd") < 0) {
+        int fd = fs_create("/etc/passwd");
+        if (fd >= 0) {
+            const char* pw = "root:x:0:0:root:/home/eigen:/user/sh.elf\n"
+                             "eigen:x:1000:1000:eigen:/home/eigen:/user/sh.elf\n";
+            int n = 0; while (pw[n]) n++;
+            fs_write(fd, pw, n);
+            fs_close(fd);
+        }
+    }
+    if (fs_resolve_impl("/cfg/starticon.cfg") < 0) {
+        int fd = fs_create("/cfg/starticon.cfg");
+        if (fd >= 0) {
+            const char* v = "cfg/logo.bmp\n";
+            int n = 0; while (v[n]) n++;
+            fs_write(fd, v, n);
+            fs_close(fd);
+        }
+    }
+    if (fs_resolve_impl("/etc/group") < 0) {
+        int fd = fs_create("/etc/group");
+        if (fd >= 0) {
+            const char* gr = "root:x:0:\neigen:x:1000:\n";
+            int n = 0; while (gr[n]) n++;
+            fs_write(fd, gr, n);
+            fs_close(fd);
+        }
+    }
 
     home_dir_index = ensure_dir_chain("home/eigen");
     desktop_dir_index = ensure_dir_chain("home/eigen/Desktop");

@@ -1,3 +1,26 @@
+/***************************************************************/
+/*                                                             */
+/* Copyright (C) Sidney 2024-2026. All rights reserved.        */
+/* Written by Sidney.                                          */
+/* Distributed under terms of the GNU General Public License.  */
+/*                                                             */
+/***************************************************************/
+
+/* pty.c — pseudo-terminal pairs for the EigenOS graphical terminal.
+ *
+ * A PTY is a connected pair of ring buffers:
+ *
+ *   [keyboard] -> MASTER  --(line discipline)-->  SLAVE  -> [shell stdin]
+ *   [screen]   <- MASTER  <--(raw output)-------  SLAVE  <- [shell stdout]
+ *
+ * The GUI terminal holds the master end; the shell inherits the slave as
+ * its stdin/stdout/stderr. Cooked mode (default) gives the shell clean
+ * lines: we echo typed characters, handle backspace, map Enter to 
+ and
+ * deliver SIGINT on ^C. Raw mode (tcsetattr without ICANON) hands every
+ * byte straight through so full-screen programs (vi, htop) see exactly
+ * what is typed.
+ */
 /* PTY pseudo-terminal subsystem: master (emulator) <-> line discipline <->
  * slave (shell). Built on the same ring-buffer pattern as pipes. */
 #include <kernel/task/task.h>
@@ -128,12 +151,14 @@ int sys_openpty(int fds[2]) {
     task_t* cur = get_current_task();
     int m = alloc_fd(cur);
     if (m < 0) { p->used = 0; return -1; }
-    int s = alloc_fd(cur);
-    if (s < 0) { cur->fd_types[m] = FD_VFS; p->used = 0; return -1; }
-
+    /* Mark the master BEFORE allocating the slave: alloc_fd scans for
+       FD_VFS slots, so an unconfigured master would be handed out twice
+       (m == s) and the slave config would clobber the master. */
     int idx = (int)(p - ptys);
     cur->fd_types[m] = FD_PTY; cur->fd_pty[m] = (uint8_t)idx;
     cur->fd_flags_extra[m] = PTY_MASTER;
+    int s = alloc_fd(cur);
+    if (s < 0) { cur->fd_types[m] = FD_VFS; p->used = 0; return -1; }
     cur->fd_types[s] = FD_PTY; cur->fd_pty[s] = (uint8_t)idx;
     cur->fd_flags_extra[s] = PTY_SLAVE;
 
@@ -169,6 +194,18 @@ int pty_set_winsize(int idx, uint32_t rows, uint32_t cols) {
     return 0;
 }
 
+int pty_get_winsize(int idx, uint32_t* rows, uint32_t* cols) {
+    if (idx < 0 || idx >= MAX_PTYS || !ptys[idx].used) return -1;
+    if (rows) *rows = ptys[idx].rows;
+    if (cols) *cols = ptys[idx].cols;
+    return 0;
+}
+
+int pty_get_fg(int idx) {
+    if (idx < 0 || idx >= MAX_PTYS || !ptys[idx].used) return 0;
+    return (int)ptys[idx].fg_pid;
+}
+
 int pty_set_fg(int idx, uint32_t pid) {
     if (idx < 0 || idx >= MAX_PTYS || !ptys[idx].used) return -1;
     ptys[idx].fg_pid = pid;
@@ -201,7 +238,32 @@ int pty_write(int idx, int is_master, const char* buf, uint32_t count) {
         pty_input(p, buf, (int)count);
         return (int)count;
     }
-    /* slave -> master output ring */
+    /* slave -> master output ring (cooked mode applies ONLCR: bare \n
+       becomes \r\n so column tracking matches a real terminal) */
+    if (!p->raw) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (buf[i] == '\n')
+                ring_put(&p->out_head, &p->out_tail, p->out_data, '\r');
+            ring_put(&p->out_head, &p->out_tail, p->out_data, buf[i]);
+        }
+        { static int sw = 0;
+          if (!sw) {
+              sw = 1;
+              extern void serial_puts(const char*);
+              extern void serial_u64(uint64_t);
+              serial_puts("[PTY] first slave write n="); serial_u64((uint64_t)count);
+              serial_puts("\n");
+          } }
+        return (int)count;
+    }
+    { static int sw = 0;
+      if (!sw && !is_master) {
+          sw = 1;
+          extern void serial_puts(const char*);
+          extern void serial_u64(uint64_t);
+          serial_puts("[PTY] first slave write n="); serial_u64((uint64_t)count);
+          serial_puts("\n");
+      } }
     uint32_t wrote = 0;
     while (wrote < count && ring_free(p->out_head, p->out_tail))
         ring_put(&p->out_head, &p->out_tail, p->out_data, buf[wrote++]);

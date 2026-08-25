@@ -73,6 +73,20 @@
 #define EIGEN_SYS_DUP2        42
 #define EIGEN_SYS_ARCH_PRCTL  43
 #define EIGEN_SYS_SET_TID_ADDR 44
+#define EIGEN_SYS_STAT      45
+#define EIGEN_SYS_FSTAT     46
+#define EIGEN_SYS_LSTAT     47
+#define EIGEN_SYS_CHDIR     48
+#define EIGEN_SYS_GETCWD    49
+#define EIGEN_SYS_IOCTL     50
+#define EIGEN_SYS_ACCESS    51
+#define EIGEN_SYS_UNAME     52
+#define EIGEN_SYS_RT_SIGACTION   53
+#define EIGEN_SYS_RT_SIGPROCMASK 54
+#define EIGEN_SYS_GETPPID   55
+#define EIGEN_SYS_GETTIMEOFDAY 56
+#define EIGEN_SYS_CLOCK_GETTIME 57
+#define EIGEN_SYS_OPENAT     58
 
 /* POSIX-style signal numbers (tier 1) */
 #ifndef NSIG
@@ -86,7 +100,7 @@
 #define SIGTERM   15
 #define SIGWINCH 28
 
-#define EIGEN_SYS_COUNT    45
+#define EIGEN_SYS_COUNT    59
 
 /* EIGEN_SYS_EPOLL sub-operations */
 /* CREATE: () -> epoll id (1..32), owned by the calling process group */
